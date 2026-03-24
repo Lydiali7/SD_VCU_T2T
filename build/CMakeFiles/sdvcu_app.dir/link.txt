@@ -1,0 +1,1 @@
+/usr/bin/c++  -mavx512f -mavx512dq -mavx512bw -O3 CMakeFiles/sdvcu_app.dir/src/main.cpp.o CMakeFiles/sdvcu_app.dir/src/perception.cpp.o -o sdvcu_app 

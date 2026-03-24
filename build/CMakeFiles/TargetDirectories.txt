@@ -1,0 +1,3 @@
+/home/lydia/sdvcu_project/build/CMakeFiles/sdvcu_app.dir
+/home/lydia/sdvcu_project/build/CMakeFiles/edit_cache.dir
+/home/lydia/sdvcu_project/build/CMakeFiles/rebuild_cache.dir

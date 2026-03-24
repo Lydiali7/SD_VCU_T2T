@@ -2,11 +2,12 @@
 #include <thread>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <nmmintrin.h> // 用于生产者计算 CRC
 #include "perception.hpp"
 #include "spsc_queue.hpp"
 
-// Global SPSC Queue acting as the "Data Bus" between Core 3 and Core 2
-SPSCQueue<SensorData> data_bus(128);
+//队列现在传输原始二进制报文，模拟真实的 T2T 总线
+SPSCQueue<RawT2TPacket> data_bus(128);
 
 void pin_thread_to_core(int core_id) {
     cpu_set_t cpuset;
@@ -15,123 +16,91 @@ void pin_thread_to_core(int core_id) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 }
 
-// PRODUCER: Mimics high-speed data acquisition on Core 3
-/*void communication_thread() {
-    pin_thread_to_core(3);
-    std::cout << "Communication Thread: Started on Core 3" << std::endl;
-
-    SensorData packet;
-    float counter = 0.0f;
-
-    while (true) {
-        // Simulate data coming from T2T network
-        for(int i=0; i<16; i++) {
-            packet.distances[i] = 100.0f + counter;
-            if (counter > 5.0f) { packet.distances[0] = 999.9f; } // 运行一段时间后故意制造 A/B 路径差异
-        }
-        
-        if (!data_bus.push(packet)) {
-            // Queue full - usually shouldn't happen if consumer is fast enough
-        }
-        
-        counter += 0.1f;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2)); // 500Hz
-    }
-}
-
+// PRODUCER: 模拟 Core 3 从无线电接收并打包数据
 void communication_thread() {
     pin_thread_to_core(3);
-    SensorData pathA_packet, pathB_packet;
-    float counter = 0.0f;
-
-    while (true) {
-        // 正常填充数据
-        for(int i=0; i<16; i++) {
-            pathA_packet.distances[i] = 100.0f + counter;
-            pathB_packet.distances[i] = 100.0f + counter;
-        }
-
-        // 【故障注入】：每运行到一定程度，让 Path B 产生跳变
-        if (counter > 5.0f && counter < 5.2f) { 
-            pathB_packet.distances[0] = 999.9f; 
-        }
-        
-        // 我们需要修改 SPSC 队列来传两个包，或者连续 push 两次
-        // 为了演示方便，我们直接把 A 和 B 传给校验函数（如果它们在同一个核）
-        PerceptionEngine::process_redundant_data(pathA_packet, pathB_packet);
-        
-        counter += 0.1f;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-}
-
-// CONSUMER: Runs SIL4 Perception Logic on Core 2
-void control_thread() {
-    pin_thread_to_core(2);
-    std::cout << "Control Thread: Started on Core 2" << std::endl;
-
-    SensorData current_packet;
-    while (true) {
-        if (data_bus.pop(current_packet)) {
-            // Use AVX-512 to process the incoming packet
-            // Here we compare it against itself to simulate redundancy check
-            PerceptionEngine::process_redundant_data(current_packet, current_packet);
-        }
-        // Small hint to CPU to reduce power during busy-wait
-        asm("pause"); 
-    }
-}
-    */
-
-void communication_thread() {
-    pin_thread_to_core(3);
-    SensorData packet;
-    // 初始化整个数组为 0，防止垃圾值
-    for(int i=0; i<16; i++) packet.distances[i] = 0.0f;
-
+    uint32_t seq_counter = 0;
     float sim_dist = 50.0f;
-    float sim_speed = 33.0f; 
+    float sim_speed = 33.0f;
 
     while (true) {
-        packet.distances[0] = sim_dist;
-        packet.distances[1] = sim_speed;
+        RawT2TPacket raw;
+        raw.header = 0x55AA55AA;
+        raw.seq = ++seq_counter;
         
-        // 模拟前车数据（假设前车和本车速度一样，加速度也是 0.8）
-        packet.distances[2] = 30.0f; // zhizaozhuiwei
-        packet.distances[3] = 0.8f;
+        uint64_t v_self_enc = static_cast<uint64_t>(sim_speed * 100);
+        uint64_t d_enc = static_cast<uint64_t>(sim_dist * 100);
+        uint64_t v_front_enc = static_cast<uint64_t>(30.0f * 100); 
+        raw.payload = v_self_enc | (d_enc << 16) | (v_front_enc << 48);
 
-        data_bus.push(packet);
-        if (sim_dist > 5.0f) sim_dist -= 0.1f;
+        // 先计算正确的 CRC
+        raw.crc = _mm_crc32_u64(0, raw.payload);
+
+        // 在 push 之前注入干扰
+        /*if (seq_counter % 500 == 0) {
+            raw.crc ^= 0xFFFFFFFF; // 故意破坏校验码
+            std::cout << "\n[Core 3] !!! INJECTING NETWORK NOISE (Corrupting CRC) !!!" << std::endl;
+        }*/
+       if (seq_counter % 1000 >= 500 && seq_counter % 1000 < 503) {
+            raw.crc ^= 0xFFFFFFFF; // 破坏校验
+            std::cout << "[Core 3] !!! INJECTING NETWORK INTERFERENCE !!! Seq: " << seq_counter << std::endl;
+        }
+
+        // 最后再推送到总线
+        data_bus.push(raw);
+
+        if (sim_dist > 4.5f) sim_dist -= 0.1f;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
-// Choose train type for this VCU instance
-TrainType my_train_type = TrainType::EMU_DISTRIBUTED; // Change 
+TrainType my_train_type = TrainType::EMU_DISTRIBUTED;
+
+// CONSUMER: Core 2 执行安全解析与决策
 void control_thread() {
     pin_thread_to_core(2);
-
+    uint32_t last_seq = 0; // 用于防重放校验
+    RawT2TPacket raw_in;
     SensorData current_packet;
+
+    int consecutive_errors = 0; // 连续错误计数
+    const int MAX_ALLOWED_ERRORS = 3; 
+
     while (true) {
-        if (data_bus.pop(current_packet)) {
-            // Check safety with the selected train dynamics
-            PerceptionEngine::is_system_safe(current_packet, current_packet, my_train_type, true);
+        if (data_bus.pop(raw_in)) {
+            //高速解包 & 协议安全校验
+            if (PerceptionEngine::fast_unpack(raw_in, current_packet, last_seq)) {
+
+                consecutive_errors = 0; // 成功解析置0
+                
+                //执行 SIL4 级安全决策,模拟 2oo2，传入两份一样的解析结果进行比对
+                PerceptionEngine::is_system_safe(current_packet, current_packet, my_train_type, true);
+                
+                // 更新序列号基准
+                last_seq = raw_in.seq;
+            } else {
+                consecutive_errors++;
+                std::cout << "![WARNING] Packet error detected! count: " << consecutive_errors << std::endl;
+            }
+            if (consecutive_errors >= MAX_ALLOWED_ERRORS) {
+                std::cout << "!!! CRITICAL: Too many consecutive errors, initiating emergency protocols! !!!" << std::endl;
+                // 在真实系统中，这里会触发紧急制动等安全措施
+                break; // For this simulation, we just exit the loop
+            }
         }
         asm("pause");
     }
 }
 
 int main() {
-    // Tuning: Lock memory to prevent page faults
     mlockall(MCL_CURRENT | MCL_FUTURE);
-
-    std::cout << "System Launch: Test for " << (my_train_type == TrainType::EMU_DISTRIBUTED ? "EMU" : "LOCO") << std::endl;
+    std::cout << "System Launch: T2T Protocol Acceleration Test (" 
+              << (my_train_type == TrainType::EMU_DISTRIBUTED ? "EMU" : "LOCO") << ")" << std::endl;
 
     std::thread comm_task(communication_thread);
     std::thread ctrl_task(control_thread);
 
     comm_task.join();
     ctrl_task.join();
-
     return 0;
 }

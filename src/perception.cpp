@@ -1,4 +1,33 @@
 #include "perception.hpp"
+#include <nmmintrin.h> // 包含硬件 CRC32 指令
+
+bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t & last_seq) {
+    // 帧头
+    if (raw.header != 0x55AA55AA) return false;
+
+    //防止重放攻击,如果新收到的这个包的编号还没上一个处理过的编号大，那说明这个包要么是重发的，要么是迟到的
+    if (raw.seq <= last_seq) return false;
+
+    //硬件 CRC32 校验 (利用 x86 原生指令，1 个周期完成)
+    uint32_t computed_crc = _mm_crc32_u64(0, raw.payload);
+    if (computed_crc != raw.crc) return false;
+
+    // 4. 位字段提取 (Bit-field Extraction)
+    // 假设速度放大100倍后存入前16位
+    uint16_t v_raw = raw.payload & 0xFFFF;
+    // 假设距离放大100倍后存入接下来的32位
+    uint32_t d_raw = (raw.payload >> 16) & 0xFFFFFFFF;
+    
+    uint16_t vf_raw = (raw.payload >> 48) & 0xFFFF; // 提取前车速度
+
+    out.distances[1] = v_raw / 100.0f;
+    out.distances[0] = d_raw / 100.0f;
+    out.distances[2] = vf_raw / 100.0f; // 关键：把前车速度传给算法
+    out.distances[3] = 0.8f;             // 假设前车是 LOCO 性能
+    //out.distances[3] = 1.2f;             // 假设前车是emu
+
+    return true;
+}
 
 float PerceptionEngine::calculate_safe_envelope(float v, TrainType type) {
     float a, t;

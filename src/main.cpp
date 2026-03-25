@@ -2,6 +2,7 @@
 #include <vector>
 #include <thread>
 #include <iomanip>
+#include <algorithm>
 #include <sys/mman.h>
 #include <pthread.h>
 #include "perception.hpp"
@@ -26,15 +27,15 @@ void world_simulator_thread() {
 
     while (true) {
         for (int i = 0; i < 5; ++i) {
-            // Newton's Second Law
+            // F = ma -> Physics Integration
             double force = fleet[i].cmd_force;
             double accel = force / fleet[i].mass;
             fleet[i].accel = accel;
             fleet[i].vel += accel * dt;
-            if (fleet[i].vel < 0) fleet[i].vel = 0; // Prevent reversing
+            if (fleet[i].vel < 0) fleet[i].vel = 0; 
             fleet[i].pos += fleet[i].vel * dt;
 
-            // Broadcast state to the following train
+            // T2T Broadcast logic
             if (i < 4) {
                 RawT2TPacket pkt = { (uint32_t)i, 0x55AA55AA, ++global_seq, 0, 0 };
                 uint64_t v_enc = (uint64_t)(fleet[i].vel * 100);
@@ -63,15 +64,31 @@ void follower_control_thread(int id, int target_core) {
                 float d_actual = p_f - fleet[id].pos;
                 float d_safe = PerceptionEngine::calculate_safe_dist(fleet[id].vel, v_f, TrainType::EMU_DISTRIBUTED);
 
-                // PD Control Law to maintain dynamic safety gap
-                float error = d_actual - d_safe;
+                // --- IMPROVED PD CONTROL LAW (Mass-Normalized) ---
+                
+                // 1. Add a 2.0m Comfort Buffer to the target gap
+                float target_gap = d_safe + 2.0f;
+                float error = d_actual - target_gap;
                 float v_diff = v_f - fleet[id].vel;
-                fleet[id].cmd_force = (error * 25000.0f) + (v_diff * 35000.0f);
-                float gap=d_safe+2.0f;
 
-                // Actuator saturation limits
-                if (fleet[id].cmd_force > 150000.0f) fleet[id].cmd_force = 150000.0f;
-                if (fleet[id].cmd_force < -250000.0f) fleet[id].cmd_force = -250000.0f;
+                // 2. Calculate Base Acceleration Command (m/s^2)
+                // Kp = 0.5, Kd = 0.8 (Stable for large inertia)
+                float accel_cmd = (error * 0.5f) + (v_diff * 0.8f);
+
+                // 3. Convert to Force based on Mass (F = m * a)
+                fleet[id].cmd_force = fleet[id].mass * accel_cmd;
+
+                // 4. Actuator Saturation Limits (Dynamic based on Mass)
+                // Max Traction: 1.0 m/s^2 | Max Braking: -1.3 m/s^2
+                float max_traction = fleet[id].mass * 1.0f;
+                float max_braking  = fleet[id].mass * -1.3f;
+
+                fleet[id].cmd_force = std::clamp(fleet[id].cmd_force, max_braking, max_traction);
+                
+                // --- EMERGENCY SAFETY OVERRIDE ---
+                if (d_actual < d_safe) {
+                    fleet[id].cmd_force = max_braking; // Force maximum emergency brake
+                }
             }
         }
         asm("pause");
@@ -83,8 +100,8 @@ void dashboard_thread() {
     pin_thread_to_core(0);
     while (true) {
         std::cout << "\033[2J\033[H"; 
-        std::cout << "=== SD-VCU 5-TRAIN DISTRIBUTED PLATOON SIM ===\n";
-        std::cout << "Event: Cruising at 108km/h, Leader brakes at T+10s\n";
+        std::cout << "=== SD-VCU EMU-PLATOON (450t) SIMULATION ===\n";
+        std::cout << "Config: Mass-Normalized PD Control | Gap Buffer: 2.0m\n";
         std::cout << "------------------------------------------------------------\n";
         std::cout << "ID | Pos(m) | Vel(km/h) | Gap(m) | Safe(m) | Force(kN)\n";
         std::cout << "------------------------------------------------------------\n";
@@ -101,15 +118,20 @@ void dashboard_thread() {
 int main() {
     mlockall(MCL_CURRENT | MCL_FUTURE);
     
-    // Initialize Fleet state
-    fleet[0].pos = 500.0; fleet[0].vel = 30.0; fleet[0].cmd_force = 0;
+    // Initialize Fleet state (Standard 450t EMU Trainsets)
+    const float EMU_MASS = 450000.0f; 
+    
+    fleet[0].mass = EMU_MASS;
+    fleet[0].pos = 1000.0; fleet[0].vel = 30.0; fleet[0].cmd_force = 0;
+
     for(int i=1; i<5; i++) {
         mailboxes[i] = new SPSCQueue<RawT2TPacket>(128);
-        fleet[i].pos = 500.0 - i * 50.0; 
+        fleet[i].mass = EMU_MASS;
+        fleet[i].pos = 1000.0 - i * 60.0; // Initial 60m spacing
         fleet[i].vel = 30.0;
     }
 
-    // Launch threads with specific CPU core affinities
+    // Launch threads
     std::thread world(world_simulator_thread);
     std::thread vcu1(follower_control_thread, 1, 1);
     std::thread vcu2(follower_control_thread, 2, 2);
@@ -117,9 +139,9 @@ int main() {
     std::thread vcu4(follower_control_thread, 4, 4);
     std::thread dash(dashboard_thread);
 
-    // Scenario Injection: Leader emergency brake after 10 seconds
+    // Scenario: Leader emergency brake (1.2 m/s^2) after 10 seconds
     std::this_thread::sleep_for(std::chrono::seconds(10));
-    fleet[0].cmd_force = -180000.0f; 
+    fleet[0].cmd_force = fleet[0].mass * -1.2f; 
 
     world.join();
     return 0;

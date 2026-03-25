@@ -12,6 +12,8 @@ bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uin
     // Bit-field extraction
     uint16_t v_raw = raw.payload & 0xFFFF;
     uint32_t p_raw = (raw.payload >> 16) & 0xFFFFFFFF;
+    int16_t a_raw = (int16_t)(raw.payload >> 48);
+    out.distances[2] = a_raw / 100.0f;
 
     out.distances[1] = v_raw / 100.0f; // Front vehicle speed
     out.distances[0] = p_raw / 100.0f; // Front vehicle absolute position

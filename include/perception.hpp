@@ -9,7 +9,7 @@ struct RawT2TPacket {
     uint32_t sender_id; 
     uint32_t header;    
     uint32_t seq;       
-    uint64_t payload;   // Bit 0-15: Speed, Bit 16-47: Absolute Position
+    uint64_t payload;   // Bit 0-15: Speed, Bit 16-47: Absolute Position,48-63: Acceleration
     uint32_t crc;       
 };
 
@@ -20,14 +20,14 @@ struct TrainState {
     double vel;         // Velocity (m/s)
     double accel;       // Acceleration (m/s^2)
     float cmd_force;    // VCU commanded force (N)
-    float mass = 50000.0f; 
+    float mass = 450000.0f; 
 };
 
 enum class TrainType { LOCO_HAULED, EMU_DISTRIBUTED };
 
 // SIMD aligned sensor data array
 struct alignas(64) SensorData {
-    float distances[16]; 
+    float distances[16]; //0pos, 1vel, 2accel
 };
 
 class PerceptionEngine {

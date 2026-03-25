@@ -67,6 +67,7 @@ void follower_control_thread(int id, int target_core) {
                 float error = d_actual - d_safe;
                 float v_diff = v_f - fleet[id].vel;
                 fleet[id].cmd_force = (error * 25000.0f) + (v_diff * 35000.0f);
+                float gap=d_safe+2.0f;
 
                 // Actuator saturation limits
                 if (fleet[id].cmd_force > 150000.0f) fleet[id].cmd_force = 150000.0f;

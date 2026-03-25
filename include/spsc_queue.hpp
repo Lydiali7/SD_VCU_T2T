@@ -6,9 +6,9 @@ template <typename T>
 class SPSCQueue {
 public:
     explicit SPSCQueue(size_t capacity) : capacity_(capacity), buffer_(capacity + 1) {
-        head_.store(0);
-        tail_.store(0);
-    }
+        head_.store(0);//write
+        tail_.store(0);//read
+    }//capacity + 1 to distinguish full vs empty
 
     bool push(const T& item) {
         size_t head = head_.load(std::memory_order_relaxed);

@@ -3,21 +3,28 @@
 
 #define MULTICAST_GROUP "239.0.0.1"
 #define MULTICAST_PORT 8888
-#define VCU_REPORT_PORT 9000 // Server listens here for VCU force reports
+#define VCU_REPORT_PORT 9000
 
-// 1. Server -> VCU: Broadcasted Physics State (Replaces RawT2TPacket)
+#pragma pack(push, 1)
+
+// Server -> VCU: Broadcasted Physics State 
 struct WorldUpdatePacket {
-    uint32_t header; // 0x55AA55AA
-    uint32_t seq;
-    uint32_t train_id;
-    double pos;
-    double vel;
-    double accel;
-    uint32_t crc; // We can keep your CRC logic!
+    uint32_t header;       // 0x55AA55AA
+    uint32_t seq;          // Sequence number
+    double timestamp;      // Global precise timestamp for latency calculation
+    uint32_t train_id;     // ID of the train
+    double pos;            // Absolute position (m)
+    double vel;            // Velocity (m/s)
+    double accel;          // Acceleration (m/s^2)
+    uint32_t status_flag;  // 0 = OK, 1 = DEGRADED
+    uint32_t crc;          // Checksum
 };
 
-// 2. VCU -> Server: Force Command Report
+// VCU -> Server: Force Command Report
 struct ForceReportPacket {
-    uint32_t train_id;
-    float cmd_force;
+    uint32_t train_id;     // Which VCU is reporting
+    float cmd_force;       // The calculated force (N)
+    uint32_t status_flag;  // 0 = OK, 1 = DEGRADED
 };
+
+#pragma pack(pop)

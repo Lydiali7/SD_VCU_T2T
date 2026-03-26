@@ -12,6 +12,7 @@
 #include "network_proto.hpp"
 
 std::vector<TrainState> fleet(5);
+std::vector<uint32_t> fleet_status(5, 0); // 0 = OK, 1 = DEGRADED
 std::ofstream log_file;
 
 int init_multicast_sender(struct sockaddr_in& group_addr) {
@@ -45,16 +46,22 @@ void receive_forces_thread(int sd) {
         if (recv(sd, &report, sizeof(report), 0) > 0) {
             if (report.train_id > 0 && report.train_id < 5) {
                 fleet[report.train_id].cmd_force = report.cmd_force;
+                fleet_status[report.train_id] = report.status_flag;
             }
         }
     }
+}
+
+// Get global timestamp in seconds
+double get_global_time() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
 int main() {
     log_file.open("fleet_log.csv");
     log_file << "Time,ID,Pos,Vel,Gap,Safe,Force\n";
 
-    // Phase 1 Initialization: Standstill, 150m safe gap
     for(int i = 0; i < 5; i++) {
         fleet[i].mass = 450000.0f;
         fleet[i].pos = 5000.0 - i * 150.0; 
@@ -69,41 +76,55 @@ int main() {
 
     const double dt = 0.01;
     uint32_t step = 0;
+    
+    // Davis Equation Coefficients for EMU
+    const float DAVIS_A = 2500.0f;  
+    const float DAVIS_B = 30.0f;    
+    const float DAVIS_C = 4.5f;     
+
     auto start_time = std::chrono::steady_clock::now();
 
     while (true) {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start_time).count();
+        double current_timestamp = get_global_time();
 
-        // ---------------------------------------------------------
-        // State Machine for Train 0 (Real-world Scenario)
-        // ---------------------------------------------------------
+        // Phase control for Leader
         if (elapsed < 5.0) {
-            // Phase 1: Standby and Network Handshake
             fleet[0].cmd_force = 0.0f; 
-        } 
-        else if (elapsed >= 5.0 && elapsed < 25.0) {
-            // Phase 2: Dynamic Merging & Acceleration to 30m/s
-            if (fleet[0].vel < 30.0) {
-                fleet[0].cmd_force = fleet[0].mass * 0.8f;
-            } else {
-                fleet[0].cmd_force = 0.0f;
-            }
-        }
-        else if (elapsed >= 25.0 && elapsed < 40.0) {
-            // Phase 3: Cruising state
+        } else if (elapsed >= 5.0 && elapsed < 25.0) {
+            if (fleet[0].vel < 30.0) fleet[0].cmd_force = fleet[0].mass * 0.8f;
+            else fleet[0].cmd_force = 0.0f;
+        } else if (elapsed >= 25.0 && elapsed < 40.0) {
             if (fleet[0].vel < 29.8) fleet[0].cmd_force = fleet[0].mass * 0.5f;
             else if (fleet[0].vel > 30.2) fleet[0].cmd_force = fleet[0].mass * -0.5f;
             else fleet[0].cmd_force = 0.0f;
-        }
-        else if (elapsed >= 40.0) {
-            // Phase 4: Emergency Braking
+        } else if (elapsed >= 40.0) {
             fleet[0].cmd_force = fleet[0].mass * -1.2f;
         }
 
-        // Physics Update and Logging
+        // Physics Update with Davis Resistance
         for (int i = 0; i < 5; ++i) {
-            fleet[i].accel = fleet[i].cmd_force / fleet[i].mass;
+            float v = fleet[i].vel;
+            float resistance = 0.0f;
+            
+            if (v > 0.01f) {
+                resistance = DAVIS_A + DAVIS_B * v + DAVIS_C * v * v;
+            }
+
+            float net_force = fleet[i].cmd_force;
+            if (v > 0.01f) {
+                net_force -= resistance;
+            } else {
+                // Prevent moving backwards due to resistance or small braking forces at standstill
+                if (net_force < DAVIS_A && net_force > -DAVIS_A) {
+                    net_force = 0.0f;
+                } else if (net_force >= DAVIS_A) {
+                    net_force -= DAVIS_A;
+                }
+            }
+
+            fleet[i].accel = net_force / fleet[i].mass;
             fleet[i].vel = std::max(0.0, fleet[i].vel + fleet[i].accel * dt);
             fleet[i].pos += fleet[i].vel * dt;
 
@@ -114,7 +135,10 @@ int main() {
                      << fleet[i].vel << "," << gap << "," << safe_dist << ","
                      << fleet[i].cmd_force << "\n";
 
-            WorldUpdatePacket pkt = {0x55AA55AA, step, (uint32_t)i, fleet[i].pos, fleet[i].vel, fleet[i].accel, 0};
+            WorldUpdatePacket pkt = {
+                0x55AA55AA, step, current_timestamp, (uint32_t)i, 
+                fleet[i].pos, fleet[i].vel, fleet[i].accel, fleet_status[i], 0
+            };
             sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
         }
 
@@ -122,16 +146,15 @@ int main() {
             std::printf("\033[2J\033[H"); 
             std::printf("=== SD-VCU DISTRIBUTED NETWORK MONITOR ===\n");
             std::printf("Sim Time: %.2fs | Network: UDP Multicast 239.0.0.1\n", elapsed);
-            std::printf("------------------------------------------------------------------------\n");
-            std::printf("ID |  Pos(m) | Vel(km/h) |  Gap(m) | Safe(m) | Force(kN) | Status\n");
-            std::printf("------------------------------------------------------------------------\n");
+            std::printf("--------------------------------------------------------------------------------\n");
+            std::printf("ID |  Pos(m) | Vel(km/h) |  Gap(m) | Safe(m) | Force(kN) | NetAccel | Status\n");
+            std::printf("--------------------------------------------------------------------------------\n");
             for (int i = 0; i < 5; ++i) {
                 float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
                 float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::EMU_DISTRIBUTED);
-
-                const char* status = (i > 0 && fleet[i].cmd_force <= fleet[i].mass * -0.5f && elapsed > 5.0 && fleet[i].vel > 0.1) ? "BRAKING" : "OK";
-                std::printf("[%d] | %7.1f | %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 
-                            i, fleet[i].pos, fleet[i].vel*3.6, gap, safe_dist, fleet[i].cmd_force/1000.0, status);
+                const char* status = (fleet_status[i] == 1) ? "DEGRADED" : "OK";
+                std::printf("[%d] | %7.1f | %9.1f | %7.1f | %7.1f | %9.1f | %8.2f | %s\n", 
+                            i, fleet[i].pos, fleet[i].vel*3.6, gap, safe_dist, fleet[i].cmd_force/1000.0, fleet[i].accel, status);
             }
         }
 

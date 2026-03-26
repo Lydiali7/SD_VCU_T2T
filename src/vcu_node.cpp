@@ -36,6 +36,11 @@ int init_force_sender(struct sockaddr_in& server_addr) {
     return sd;
 }
 
+double get_global_time() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 2) return 1;
     int my_id = std::stoi(argv[1]);
@@ -45,9 +50,15 @@ int main(int argc, char* argv[]) {
     const float DT = 0.01f;          
     const float MAX_JERK = 0.75f;    
     
-    double my_vel = 0.0; // Phase 1: Start from standstill
-    double my_pos = 5000.0 - my_id * 150.0; // Phase 1: 150m initial gap
+    double my_vel = 0.0; 
+    double my_pos = 5000.0 - my_id * 150.0; 
     float current_actual_force = 0.0f; 
+    
+    // PID Controller variables
+    float integral_error = 0.0f;
+    const float KP = 0.5f;
+    const float KI = 0.02f; // Small integral gain to fight air resistance
+    const float KD = 0.8f;
 
     int recv_sd = init_multicast_recv();
     struct sockaddr_in server_addr;
@@ -59,8 +70,11 @@ int main(int argc, char* argv[]) {
 
     while (true) {
         int bytes = recv(recv_sd, &pkt, sizeof(pkt), 0);
+        uint32_t my_status = 0; 
         
         if (bytes > 0 && pkt.header == 0x55AA55AA) {
+            double latency_ms = (get_global_time() - pkt.timestamp) * 1000.0;
+
             if (pkt.train_id == (uint32_t)my_id) {
                 my_vel = pkt.vel;
                 my_pos = pkt.pos; 
@@ -71,13 +85,25 @@ int main(int argc, char* argv[]) {
                 
                 float d_safe = PerceptionEngine::calculate_safe_dist(my_vel, pkt.vel, TrainType::EMU_DISTRIBUTED);
                 float d_actual = pkt.pos - my_pos; 
-                float target_gap = d_safe + 5.0f; // Maintain a 5m buffer above safe line
+                float target_gap = d_safe + 5.0f; 
                 float target_force = 0.0f;
 
-                if (d_actual < d_safe) {
+                // Cooperative Degradation: If front train is degraded, I must be careful
+                if (pkt.status_flag == 1) {
+                    target_force = MASS * -0.8f;
+                    my_status = 1; 
+                }
+                else if (d_actual < d_safe) {
                     target_force = MASS * -1.3f; 
-                } else {
-                    float accel_cmd = pkt.accel + (d_actual - target_gap) * 0.5f + (pkt.vel - my_vel) * 0.8f;
+                } 
+                else {
+                    float error = d_actual - target_gap;
+                    
+                    // Anti-windup for Integral term
+                    integral_error += error * DT;
+                    integral_error = std::clamp(integral_error, -20.0f, 20.0f); 
+
+                    float accel_cmd = pkt.accel + (error * KP) + (integral_error * KI) + ((pkt.vel - my_vel) * KD);
                     target_force = std::clamp(MASS * accel_cmd, MASS * -1.3f, MASS * 1.0f);
                 }
 
@@ -86,24 +112,26 @@ int main(int argc, char* argv[]) {
                 else if (target_force < current_actual_force - max_force_delta) current_actual_force -= max_force_delta;
                 else current_actual_force = target_force;     
 
-                ForceReportPacket report = {(uint32_t)my_id, current_actual_force};
+                ForceReportPacket report = {(uint32_t)my_id, current_actual_force, my_status};
                 sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
 
                 if (pkt.seq % 50 == 0) {
-                    std::printf("Target: T%d | Vel: %5.1f | Gap: %5.1f | Safe: %5.1f | Output: %5.0f\n", 
-                                target_front_id, pkt.vel*3.6, d_actual, d_safe, current_actual_force/1000);
+                    std::printf("Target: T%d | Latency: %4.1fms | Gap: %5.1f | Safe: %5.1f | Output: %5.0f\n", 
+                                target_front_id, latency_ms, d_actual, d_safe, current_actual_force/1000);
                 }
             }
         } else if (bytes < 0) {
             float target_force = MASS * -0.5f;
+            my_status = 1; // Mark myself as DEGRADED due to timeout
+            
             float max_force_delta = MASS * MAX_JERK * DT; 
             if (target_force > current_actual_force + max_force_delta) current_actual_force += max_force_delta;
             else if (target_force < current_actual_force - max_force_delta) current_actual_force -= max_force_delta;
             else current_actual_force = target_force;
             
-            ForceReportPacket report = {(uint32_t)my_id, current_actual_force};
+            ForceReportPacket report = {(uint32_t)my_id, current_actual_force, my_status};
             sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
-            std::printf("Warning: Timeout detected. Entering degraded mode. Output: %5.0f\n", current_actual_force/1000);
+            std::printf("[WARNING] Timeout detected. Entering degraded mode. Output: %5.0f\n", current_actual_force/1000);
         }
     }
     return 0;

@@ -21,10 +21,10 @@ bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uin
 }
 
 float PerceptionEngine::calculate_safe_dist(float v_s, float v_f, TrainType type) {
-    float a_self = 1.2f;    // Current train braking rate (EMU)
-    float a_front = 0.8f;   // Worst-case assumption for front train (LOCO)
-    float t_delay = 0.2f;   // System reaction delay
-    float d_buffer = 5.0f;  // Absolute minimum safety buffer
+    float a_self = 1.0f;    // Current train braking rate (EMU)
+    float a_front = 1.2f;   // Worst-case assumption for front train (LOCO)
+    float t_delay = 0.5f;   // System reaction delay
+    float d_buffer = 15.0f;  // Absolute minimum safety buffer
 
     // Relative distance covered during reaction time
     float rel_dist = std::max(0.0f, (v_s - v_f) * t_delay);

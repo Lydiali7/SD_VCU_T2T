@@ -1,21 +1,37 @@
 # SD-VCU: Software-Defined Vehicle Control Unit
-## 5-Train Distributed Virtual Coupling Simulation
+## Distributed Virtual Coupling & Platoon Simulation (v2.0 Networked)
 
 ### Project Overview
-This project implements a high-performance, real-time distributed simulation for train virtual coupling (platooning). It moves beyond static distance protection to a dynamic, cooperative control model that compresses headways safely at high speeds.
+This project implements a **High-Fidelity Distributed Simulation** for Train Virtual Coupling (VC). By moving beyond traditional moving-block signaling, it enables a 5-train platoon to maintain "breathing" safety gaps at high speeds (120km/h+) through real-time **T2T (Train-to-Train)** communication via UDP Multicast.
 
-### Core Modules
-1. **Virtual Physics Engine ($F=ma$)**: A high-fidelity simulator running on a 10ms step, calculating real-time velocity and position based on VCU force outputs.
-2. **Virtual T2T Bus**: A lock-free SPSC (Single-Producer Single-Consumer) communication backbone simulating sub-2ms wireless packet exchange between trains.
-3. **Dynamic Safety Envelope**: A SIL4-inspired calculus that adjusts safety gaps in real-time based on relative velocity, braking performance (EMU vs. LOCO), and reaction latency.
-4. **Multi-core Distributed VCU**: Parallelized control logic with thread-to-core affinity (Cores 1-4), utilizing PD-control laws to maintain string stability across a 5-train platoon.
+The system simulates 450-ton EMU trainsets, managing their dynamics under realistic network conditions including jitter and packet loss.
+
+### Core Technical Pillars
+1. **Distributed Architecture**: 
+   - **World Server**: A physics engine running at 100Hz, broadcasting global states via **UDP Multicast (239.0.0.1)**.
+   - **VCU Nodes**: Independent Linux processes representing each train's controller, performing decentralized decision-making.
+2. **String Stability (CACC)**: 
+   - Implements **Feed-forward Control** by embedding leader acceleration in T2T packets, eliminating error amplification (the "Slinky Effect") across the platoon.
+3. **Resilience & Fail-safe**:
+   - **Fault Injection**: Simulated 5% random packet loss to test robustness.
+   - **Degraded Mode**: Automatic transition to "Safe Coast" braking if T2T communication is lost for >50ms.
+4. **Hardware Acceleration**: 
+   - **AVX-512** for perception logic and **SSE4.2** for hardware-based CRC32 packet integrity checks.
+
+### Project Structure
+* `src/world_server.cpp`: The "God" process. Manages physics and global state broadcast.
+* `src/vcu_node.cpp`: The "Brain" process. Runs the control law for an individual train.
+* `src/main.cpp`: Legacy single-process multi-threaded simulator (Baseline).
+* `include/perception.hpp`: Sensor fusion and safety envelope calculus.
+* `include/network_proto.hpp`: UDP binary protocol definition.
 
 ### Tech Stack
 - **Language**: C++
-- **Hardware Acceleration**: AVX-512 (SIMD), SSE4.2 (Hardware CRC32)
-- **Concurrency**: Lock-free queues, Pthread Affinity, Multithreading
-- **Optimization**: O3, Memory Locking (mlockall)
+- **Networking**: UDP Multicast, Socket Programming
+- **OS**: Linux (Optimized with `mlockall` and Pthread Affinity)
+- **Build**: GNU Make
 
-### Simulation Scenarios
-- **Auto-Coupling**: Trains automatically compress 50m initial gaps to ~6m dynamic safety buffers.
-- **Emergency Braking**: Simulates a Leader brake event at 120km/h; Followers react within milliseconds to maintain safety bubbles without collision.
+### How to Run
+1. **Build all targets**:
+   ```bash
+   make all

@@ -31,7 +31,9 @@ The system simulates 450-ton EMU trainsets, managing their dynamics under realis
 - **OS**: Linux (Optimized with `mlockall` and Pthread Affinity)
 - **Build**: GNU Make
 
-### How to Run
+### How to Run(need different terminal)
 1. **Build all targets**:
    ```bash
    make all
+2. **Start world_server**
+3. **Start the vcu_node one by one**

@@ -1,16 +1,18 @@
 #include <iostream>
 #include <vector>
 #include <thread>
-#include <chrono>
-#include <random>
+#include <fstream>
+#include <iomanip>
+#include <algorithm>
 #include <cstring>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <chrono>
 #include "perception.hpp"
 #include "network_proto.hpp"
 
 std::vector<TrainState> fleet(5);
-bool chaos_mode = true; 
+std::ofstream log_file;
 
 // Setup UDP Multicast Sender
 int init_multicast_sender(struct sockaddr_in& group_addr) {
@@ -31,7 +33,7 @@ int init_force_receiver() {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(VCU_REPORT_PORT);
     bind(sd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    
+
     // Set non-blocking so physics loop doesn't freeze
     struct timeval tv;
     tv.tv_sec = 0;
@@ -53,61 +55,74 @@ void receive_forces_thread(int sd) {
 }
 
 int main() {
+    // Initialize CSV log file with Gap and Safe columns
+    log_file.open("fleet_log.csv");
+    log_file << "Time,ID,Pos,Vel,Gap,Safe,Force\n";
+
     // Initialize Fleet (450t EMU)
-    for(int i=0; i<5; i++) {
+    for(int i = 0; i < 5; i++) {
         fleet[i].mass = 450000.0f;
-        fleet[i].pos = 1000 - i * 60; 
-        fleet[i].vel = 30;
+        fleet[i].pos = 2000.0 - i * 60.0; 
+        fleet[i].vel = 30.0;
     }
 
     struct sockaddr_in group_addr;
     int send_sd = init_multicast_sender(group_addr);
     int recv_sd = init_force_receiver();
-
     std::thread recv_thread(receive_forces_thread, recv_sd);
 
     const double dt = 0.01;
-    uint32_t global_seq = 0;
-    std::default_random_engine generator;
-    std::uniform_real_distribution<double> distribution(0.0, 1.0);
-
-    std::cout << "World Physics Server Started on UDP 239.0.0.1:8888\n";
+    uint32_t step = 0;
     auto start_time = std::chrono::steady_clock::now();
 
     while (true) {
-        // Trigger Leader Brake after 10s
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() == 10) {
-            fleet[0].cmd_force = fleet[0].mass * -1.2f; 
+        double elapsed = std::chrono::duration<double>(now - start_time).count();
+
+        // Scenario Injection: Leader emergency brake after 10s
+        if (elapsed > 10.0) {
+            fleet[0].cmd_force = fleet[0].mass * -1.2f;
         }
 
-        // Physics Update
+        // Physics Update and Logging
         for (int i = 0; i < 5; ++i) {
             fleet[i].accel = fleet[i].cmd_force / fleet[i].mass;
             fleet[i].vel = std::max(0.0, fleet[i].vel + fleet[i].accel * dt);
             fleet[i].pos += fleet[i].vel * dt;
 
-            // Broadcast state
-            if (chaos_mode && distribution(generator) < 0.05) continue; // 5% Loss
+            // Calculate Gap and Safe Distance for logging
+            float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
+            float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::EMU_DISTRIBUTED);
 
-            WorldUpdatePacket pkt;
-            pkt.header = 0x55AA55AA;
-            pkt.seq = ++global_seq;
-            pkt.train_id = i;
-            pkt.pos = fleet[i].pos;
-            pkt.vel = fleet[i].vel;
-            pkt.accel = fleet[i].accel;
-            
+            log_file << elapsed << "," << i << "," << fleet[i].pos << ","
+                     << fleet[i].vel << "," << gap << "," << safe_dist << ","
+                     << fleet[i].cmd_force << "\n";
+
+            // Broadcast state via UDP
+            WorldUpdatePacket pkt = {0x55AA55AA, step, (uint32_t)i, fleet[i].pos, fleet[i].vel, fleet[i].accel, 0};
             sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
         }
 
-        // Console Dashboard
-        std::printf("\rWorld Time: %u | L_Pos: %.1f | L_Vel: %.1f | L_Force: %.0f    ", 
-                    global_seq, fleet[0].pos, fleet[0].vel*3.6, fleet[0].cmd_force/1000);
-        std::fflush(stdout);
+        // Dashboard Display (Refresh every 10 steps / 100ms)
+        if (step % 10 == 0) {
+            std::printf("\033[2J\033[H"); 
+            std::printf("=== SD-VCU DISTRIBUTED NETWORK MONITOR ===\n");
+            std::printf("Sim Time: %.2fs | Network: UDP Multicast 239.0.0.1\n", elapsed);
+            std::printf("------------------------------------------------------------------------\n");
+            std::printf("ID |  Pos(m) | Vel(km/h) |  Gap(m) | Safe(m) | Force(kN) | Status\n");
+            std::printf("------------------------------------------------------------------------\n");
+            for (int i = 0; i < 5; ++i) {
+                float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
+                float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::EMU_DISTRIBUTED);
 
+                const char* status = (i > 0 && fleet[i].cmd_force == fleet[i].mass * -0.5f) ? "\033[1;31mLOST\033[0m" : "\033[1;32mOK\033[0m";
+                std::printf("[%d] | %7.1f | %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 
+                            i, fleet[i].pos, fleet[i].vel*3.6, gap, safe_dist, fleet[i].cmd_force/1000.0, status);
+            }
+        }
+
+        step++;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
     return 0;
 }

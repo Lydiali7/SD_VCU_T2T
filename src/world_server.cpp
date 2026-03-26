@@ -14,7 +14,6 @@
 std::vector<TrainState> fleet(5);
 std::ofstream log_file;
 
-// Setup UDP Multicast Sender
 int init_multicast_sender(struct sockaddr_in& group_addr) {
     int sd = socket(AF_INET, SOCK_DGRAM, 0);
     memset(&group_addr, 0, sizeof(group_addr));
@@ -24,7 +23,6 @@ int init_multicast_sender(struct sockaddr_in& group_addr) {
     return sd;
 }
 
-// Setup UDP Unicast Receiver for Force Reports
 int init_force_receiver() {
     int sd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in server_addr;
@@ -34,15 +32,13 @@ int init_force_receiver() {
     server_addr.sin_port = htons(VCU_REPORT_PORT);
     bind(sd, (struct sockaddr*)&server_addr, sizeof(server_addr));
 
-    // Set non-blocking so physics loop doesn't freeze
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 1000; // 1ms timeout
+    tv.tv_usec = 1000; 
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return sd;
 }
 
-// Thread to receive forces from external VCUs
 void receive_forces_thread(int sd) {
     ForceReportPacket report;
     while (true) {
@@ -55,15 +51,15 @@ void receive_forces_thread(int sd) {
 }
 
 int main() {
-    // Initialize CSV log file with Gap and Safe columns
     log_file.open("fleet_log.csv");
     log_file << "Time,ID,Pos,Vel,Gap,Safe,Force\n";
 
-    // Initialize Fleet (450t EMU)
+    // Phase 1 Initialization: Standstill, 150m safe gap
     for(int i = 0; i < 5; i++) {
         fleet[i].mass = 450000.0f;
-        fleet[i].pos = 2000.0 - i * 60.0; 
-        fleet[i].vel = 30.0;
+        fleet[i].pos = 5000.0 - i * 150.0; 
+        fleet[i].vel = 0.0;
+        fleet[i].cmd_force = 0.0;
     }
 
     struct sockaddr_in group_addr;
@@ -79,8 +75,29 @@ int main() {
         auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start_time).count();
 
-        // Scenario Injection: Leader emergency brake after 10s
-        if (elapsed > 10.0) {
+        // ---------------------------------------------------------
+        // State Machine for Train 0 (Real-world Scenario)
+        // ---------------------------------------------------------
+        if (elapsed < 5.0) {
+            // Phase 1: Standby and Network Handshake
+            fleet[0].cmd_force = 0.0f; 
+        } 
+        else if (elapsed >= 5.0 && elapsed < 25.0) {
+            // Phase 2: Dynamic Merging & Acceleration to 30m/s
+            if (fleet[0].vel < 30.0) {
+                fleet[0].cmd_force = fleet[0].mass * 0.8f;
+            } else {
+                fleet[0].cmd_force = 0.0f;
+            }
+        }
+        else if (elapsed >= 25.0 && elapsed < 40.0) {
+            // Phase 3: Cruising state
+            if (fleet[0].vel < 29.8) fleet[0].cmd_force = fleet[0].mass * 0.5f;
+            else if (fleet[0].vel > 30.2) fleet[0].cmd_force = fleet[0].mass * -0.5f;
+            else fleet[0].cmd_force = 0.0f;
+        }
+        else if (elapsed >= 40.0) {
+            // Phase 4: Emergency Braking
             fleet[0].cmd_force = fleet[0].mass * -1.2f;
         }
 
@@ -90,7 +107,6 @@ int main() {
             fleet[i].vel = std::max(0.0, fleet[i].vel + fleet[i].accel * dt);
             fleet[i].pos += fleet[i].vel * dt;
 
-            // Calculate Gap and Safe Distance for logging
             float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
             float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::EMU_DISTRIBUTED);
 
@@ -98,12 +114,10 @@ int main() {
                      << fleet[i].vel << "," << gap << "," << safe_dist << ","
                      << fleet[i].cmd_force << "\n";
 
-            // Broadcast state via UDP
             WorldUpdatePacket pkt = {0x55AA55AA, step, (uint32_t)i, fleet[i].pos, fleet[i].vel, fleet[i].accel, 0};
             sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
         }
 
-        // Dashboard Display (Refresh every 10 steps / 100ms)
         if (step % 10 == 0) {
             std::printf("\033[2J\033[H"); 
             std::printf("=== SD-VCU DISTRIBUTED NETWORK MONITOR ===\n");
@@ -115,7 +129,7 @@ int main() {
                 float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
                 float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::EMU_DISTRIBUTED);
 
-                const char* status = (i > 0 && fleet[i].cmd_force == fleet[i].mass * -0.5f) ? "\033[1;31mLOST\033[0m" : "\033[1;32mOK\033[0m";
+                const char* status = (i > 0 && fleet[i].cmd_force <= fleet[i].mass * -0.5f && elapsed > 5.0 && fleet[i].vel > 0.1) ? "BRAKING" : "OK";
                 std::printf("[%d] | %7.1f | %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 
                             i, fleet[i].pos, fleet[i].vel*3.6, gap, safe_dist, fleet[i].cmd_force/1000.0, status);
             }

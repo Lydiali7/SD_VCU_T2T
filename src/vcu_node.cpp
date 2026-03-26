@@ -45,8 +45,8 @@ int main(int argc, char* argv[]) {
     const float DT = 0.01f;          
     const float MAX_JERK = 0.75f;    
     
-    double my_vel = 30.0;
-    double my_pos = 2000.0 - my_id * 60.0; 
+    double my_vel = 0.0; // Phase 1: Start from standstill
+    double my_pos = 5000.0 - my_id * 150.0; // Phase 1: 150m initial gap
     float current_actual_force = 0.0f; 
 
     int recv_sd = init_multicast_recv();
@@ -55,33 +55,32 @@ int main(int argc, char* argv[]) {
     WorldUpdatePacket pkt;
     uint32_t last_seq = 0;
 
+    std::printf("VCU Node [%d] Started. Listening for Train %d...\n", my_id, target_front_id);
+
     while (true) {
         int bytes = recv(recv_sd, &pkt, sizeof(pkt), 0);
         
         if (bytes > 0 && pkt.header == 0x55AA55AA) {
-            // 【关键修复 1】：随时随地更新自己的坐标
             if (pkt.train_id == (uint32_t)my_id) {
                 my_vel = pkt.vel;
                 my_pos = pkt.pos; 
             }
             
-            // 【关键修复 2】：只有读到前车数据时，才计算控制力并推送
             if (pkt.train_id == (uint32_t)target_front_id && pkt.seq > last_seq) {
                 last_seq = pkt.seq;
                 
                 float d_safe = PerceptionEngine::calculate_safe_dist(my_vel, pkt.vel, TrainType::EMU_DISTRIBUTED);
                 float d_actual = pkt.pos - my_pos; 
-                float target_gap = d_safe + 2.0f;
+                float target_gap = d_safe + 5.0f; // Maintain a 5m buffer above safe line
                 float target_force = 0.0f;
 
                 if (d_actual < d_safe) {
-                    target_force = MASS * -1.3f; // 突破红线，直接打满死刹
+                    target_force = MASS * -1.3f; 
                 } else {
                     float accel_cmd = pkt.accel + (d_actual - target_gap) * 0.5f + (pkt.vel - my_vel) * 0.8f;
                     target_force = std::clamp(MASS * accel_cmd, MASS * -1.3f, MASS * 1.0f);
                 }
 
-                // Jerk Limiter (物理斜坡限幅)
                 float max_force_delta = MASS * MAX_JERK * DT; 
                 if (target_force > current_actual_force + max_force_delta) current_actual_force += max_force_delta;
                 else if (target_force < current_actual_force - max_force_delta) current_actual_force -= max_force_delta;
@@ -89,9 +88,13 @@ int main(int argc, char* argv[]) {
 
                 ForceReportPacket report = {(uint32_t)my_id, current_actual_force};
                 sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+                if (pkt.seq % 50 == 0) {
+                    std::printf("Target: T%d | Vel: %5.1f | Gap: %5.1f | Safe: %5.1f | Output: %5.0f\n", 
+                                target_front_id, pkt.vel*3.6, d_actual, d_safe, current_actual_force/1000);
+                }
             }
         } else if (bytes < 0) {
-            // TIMEOUT!
             float target_force = MASS * -0.5f;
             float max_force_delta = MASS * MAX_JERK * DT; 
             if (target_force > current_actual_force + max_force_delta) current_actual_force += max_force_delta;
@@ -100,6 +103,7 @@ int main(int argc, char* argv[]) {
             
             ForceReportPacket report = {(uint32_t)my_id, current_actual_force};
             sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            std::printf("Warning: Timeout detected. Entering degraded mode. Output: %5.0f\n", current_actual_force/1000);
         }
     }
     return 0;

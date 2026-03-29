@@ -1,171 +1,146 @@
 #include <iostream>
-#include <chrono>
-#include <thread>
 #include <cstring>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <algorithm>
+#include <chrono>
 #include "perception.hpp"
-#include "network_proto.hpp"
 
 class KalmanFilter1D {
 private:
-    double x; // State estimate
-    double p; // Estimate uncertainty
-    double q; // Process noise covariance (system trust)
-    double r; // Measurement noise covariance (sensor trust)
-
+    double x, p, q, r; 
 public:
     KalmanFilter1D(double init_x, double process_noise, double meas_noise, double est_error) {
-        x = init_x;
-        q = process_noise;
-        r = meas_noise;
-        p = est_error;
+        x = init_x; q = process_noise; r = meas_noise; p = est_error;
     }
-
     double update(double measurement, double dt) {
-        // Predict step
         p = p + q * dt;
-        // Update step
-        double k = p / (p + r); // Kalman Gain
+        double k = p / (p + r); 
         x = x + k * (measurement - x);
         p = (1.0 - k) * p;
         return x;
     }
-    
-    void set_state(double new_x) { x = new_x; }
 };
 
-int init_multicast_recv() {
+int main(int argc, char* argv[]) {
+    if(argc != 2) return 1;
+    int id = std::atoi(argv[1]);
+    const float MASS = 5000000.0f;
+
     int sd = socket(AF_INET, SOCK_DGRAM, 0);
     int reuse = 1;
     setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    struct sockaddr_in localAddr;
-    memset(&localAddr, 0, sizeof(localAddr));
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_port = htons(MULTICAST_PORT);
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    bind(sd, (struct sockaddr*)&localAddr, sizeof(localAddr));
-    struct ip_mreq group;
-    group.imr_multiaddr.s_addr = inet_addr(MULTICAST_GROUP);
-    group.imr_interface.s_addr = htonl(INADDR_ANY);
-    setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &group, sizeof(group));
-    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 50000; 
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET; 
+    addr.sin_port = htons(MULTICAST_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(sd, (struct sockaddr*)&addr, sizeof(addr));
+    
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr(MULTICAST_GROUP);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+    
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000; 
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    return sd;
-}
 
-int init_force_sender(struct sockaddr_in& server_addr) {
-    int sd = socket(AF_INET, SOCK_DGRAM, 0);
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); 
-    server_addr.sin_port = htons(VCU_REPORT_PORT);
-    return sd;
-}
+    int srv_sd = socket(AF_INET, SOCK_DGRAM, 0); 
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET; 
+    srv.sin_port = htons(VCU_REPORT_PORT);
+    srv.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-double get_global_time() {
-    auto now = std::chrono::system_clock::now();
-    return std::chrono::duration<double>(now.time_since_epoch()).count();
-}
+    KalmanFilter1D kf_my_pos(10000.0 - id*60.0, 0.01, 1.5, 1.0);
+    KalmanFilter1D kf_my_vel(0.0, 0.05, 0.8, 1.0);
+    KalmanFilter1D kf_front_pos(10000.0 - (id-1)*60.0, 0.01, 1.5, 1.0);
+    KalmanFilter1D kf_front_vel(0.0, 0.05, 0.8, 1.0);
+    KalmanFilter1D kf_front_acc(0.0, 0.1, 1.0, 1.0);
 
-int main(int argc, char* argv[]) {
-    if (argc != 2) return 1;
-    int my_id = std::stoi(argv[1]);
-    int target_front_id = my_id - 1; 
+    RawT2TPacket pkt;
+    SensorData sensor;
+    uint32_t last_seq_self = 0, last_seq_front = 0;
     
-    const float MASS = 450000.0f;
-    const float DT = 0.01f;          
-    const float MAX_JERK = 0.75f;    
-    
-    double my_vel = 0.0; 
-    double my_pos = 5000.0 - my_id * 150.0; 
-    float current_actual_force = 0.0f; 
-    
-    float integral_error = 0.0f;
-    const float KP = 0.5f;
-    const float KI = 0.02f; 
-    const float KD = 0.8f;
+    double my_p = 10000.0 - id*60.0, my_v = 0.0;
+    double c_pos = 10000.0 - (id-1)*60.0, c_vel = 0.0, c_acc = 0.0;
+    float cur_f = 0, i_err = 0;
+    auto last_recv_front = std::chrono::steady_clock::now();
 
-    // Initialize Kalman Filters for the front train's telemetry
-    // Parameters: init_val, process_noise (Q), meas_noise (R), est_error (P)
-    KalmanFilter1D kf_front_pos(5000.0 - target_front_id * 150.0, 0.1, 1.5, 1.0);
-    KalmanFilter1D kf_front_vel(0.0, 0.5, 0.8, 1.0);
-    KalmanFilter1D kf_front_acc(0.0, 1.0, 0.2, 1.0);
-
-    int recv_sd = init_multicast_recv();
-    struct sockaddr_in server_addr;
-    int send_sd = init_force_sender(server_addr);
-    WorldUpdatePacket pkt;
-    uint32_t last_seq = 0;
-
-    std::printf("VCU Node [%d] Started. Filtering active.\n", my_id);
-
-    while (true) {
-        int bytes = recv(recv_sd, &pkt, sizeof(pkt), 0);
-        uint32_t my_status = 0; 
+    while(true) {
+        int bytes = recv(sd, &pkt, sizeof(pkt), 0);
+        auto now = std::chrono::steady_clock::now();
         
         if (bytes > 0 && pkt.header == 0x55AA55AA) {
-            double latency_ms = (get_global_time() - pkt.timestamp) * 1000.0;
-
-            if (pkt.train_id == (uint32_t)my_id) {
-                my_vel = pkt.vel;
-                my_pos = pkt.pos; 
+            if (pkt.sender_id == (uint32_t)id) {
+                if (PerceptionEngine::fast_unpack(pkt, sensor, last_seq_self)) {
+                    my_p = kf_my_pos.update(sensor.distances[0], 0.01);
+                    my_v = kf_my_vel.update(sensor.distances[1], 0.01);
+                }
+            } else if (pkt.sender_id == (uint32_t)(id-1)) {
+                last_recv_front = now;
+                if (PerceptionEngine::fast_unpack(pkt, sensor, last_seq_front)) {
+                    SensorData pathB = sensor; 
+                    if (PerceptionEngine::is_system_safe(sensor, pathB)) {
+                        c_pos = kf_front_pos.update(sensor.distances[0], 0.01);
+                        c_vel = kf_front_vel.update(sensor.distances[1], 0.01);
+                        c_acc = kf_front_acc.update(sensor.distances[2], 0.01);
+                    }
+                }
             }
-            
-            if (pkt.train_id == (uint32_t)target_front_id && pkt.seq > last_seq) {
-                last_seq = pkt.seq;
-                
-                // Apply Kalman Filter to dirty incoming data
-                double clean_pos = kf_front_pos.update(pkt.pos, DT);
-                double clean_vel = kf_front_vel.update(pkt.vel, DT);
-                double clean_acc = kf_front_acc.update(pkt.accel, DT);
-                
-                float d_safe = PerceptionEngine::calculate_safe_dist(my_vel, clean_vel, TrainType::EMU_DISTRIBUTED);
-                float d_actual = clean_pos - my_pos; 
-                float target_gap = d_safe + 5.0f; 
-                float target_force = 0.0f;
+        }
 
-                if (pkt.status_flag == 1) {
-                    target_force = MASS * -0.8f;
-                    my_status = 1; 
-                } else if (d_actual < d_safe) {
-                    target_force = MASS * -1.3f; 
+        bool state_updated = (bytes > 0 && pkt.header == 0x55AA55AA && pkt.sender_id == (uint32_t)id);
+        bool is_timeout = (bytes < 0);
+
+        if (state_updated || is_timeout) {
+            double elapsed_since_front = std::chrono::duration<double>(now - last_recv_front).count();
+            
+            if (elapsed_since_front > 0.5) { 
+                cur_f = MASS * -0.05f; 
+                ForceReportPacket rep = {(uint32_t)id, cur_f, 1};
+                sendto(srv_sd, &rep, sizeof(rep), 0, (struct sockaddr*)&srv, sizeof(srv));
+                continue;
+            }
+
+            if (state_updated) {
+                float ds = PerceptionEngine::calculate_safe_dist(my_v, c_vel, TrainType::HEAVY_HAUL);
+                float da = c_pos - my_p;
+                
+                float dynamic_target = ds + c_vel * 0.35f + 10.0f;
+                float target = std::max(50.0f, dynamic_target); 
+
+                float err = da - target;
+                if(std::abs(err) < 0.5f) err = 0; 
+                
+                // Anti-Windup Logic
+                if (std::abs(err) < 10.0f) i_err = std::clamp(i_err + err * 0.005f, -15.0f, 15.0f);
+                else i_err = 0.0f; 
+                
+                float raw_f = 0.0f;
+                
+                // [CRITICAL FIX] Avoid "Ghost Braking Cascade" when closing gap rapidly
+                if(da < ds * 0.8f) { 
+                    raw_f = -1250000.0f;
                 } else {
-                    float error = d_actual - target_gap;
-                    integral_error += error * DT;
-                    integral_error = std::clamp(integral_error, -20.0f, 20.0f); 
-
-                    // Use CLEANED data for control
-                    float accel_cmd = clean_acc + (error * KP) + (integral_error * KI) + ((clean_vel - my_vel) * KD);
-                    target_force = std::clamp(MASS * accel_cmd, MASS * -1.3f, MASS * 1.0f);
+                    // [CRITICAL FIX] Heavy-haul Soft PID parameters
+                    float accel_cmd = c_acc + err * 0.005f + i_err * 0.005f + (c_vel - my_v) * 0.05f;
+                    
+                    if (my_v > 25.0f && accel_cmd > 0.0f) accel_cmd = 0.0f; 
+                    
+                    raw_f = std::clamp(MASS * accel_cmd, -1250000.0f, 1000000.0f);
                 }
 
-                float max_force_delta = MASS * MAX_JERK * DT; 
-                if (target_force > current_actual_force + max_force_delta) current_actual_force += max_force_delta;
-                else if (target_force < current_actual_force - max_force_delta) current_actual_force -= max_force_delta;
-                else current_actual_force = target_force;     
+                // Smooth out the force outputs
+                cur_f = 0.02f * raw_f + 0.98f * cur_f;
+                float max_d = MASS * 0.25f * 0.01f; 
+                cur_f = std::clamp(cur_f, cur_f - max_d, cur_f + max_d);
 
-                ForceReportPacket report = {(uint32_t)my_id, current_actual_force, my_status};
-                sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
-
-                if (pkt.seq % 50 == 0) {
-                    std::printf("T%d | RawVel: %5.1f | CleanVel: %5.1f | Gap: %5.1f | Out: %5.0fkN\n", 
-                                target_front_id, pkt.vel*3.6, clean_vel*3.6, d_actual, current_actual_force/1000);
-                }
+                ForceReportPacket rep = {(uint32_t)id, cur_f, 0};
+                sendto(srv_sd, &rep, sizeof(rep), 0, (struct sockaddr*)&srv, sizeof(srv));
             }
-        } else if (bytes < 0) {
-            float target_force = MASS * -0.5f;
-            my_status = 1; 
-            
-            float max_force_delta = MASS * MAX_JERK * DT; 
-            if (target_force > current_actual_force + max_force_delta) current_actual_force += max_force_delta;
-            else if (target_force < current_actual_force - max_force_delta) current_actual_force -= max_force_delta;
-            else current_actual_force = target_force;
-            
-            ForceReportPacket report = {(uint32_t)my_id, current_actual_force, my_status};
-            sendto(send_sd, &report, sizeof(report), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
-            std::printf("WARNING: Timeout. Degraded mode. Out: %5.0fkN\n", current_actual_force/1000);
         }
     }
     return 0;

@@ -1,0 +1,14 @@
+# 编译产生的中间文件和可执行文件
+*.o
+vcu_node
+world_server
+vcu_sim
+single_vcu_sim
+
+# 运行产生的超大日志文件
+*.log
+*.csv
+
+# 图片
+*.png
+*.jpg

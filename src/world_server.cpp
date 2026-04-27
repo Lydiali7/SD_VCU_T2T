@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include "perception.hpp"
+#include "t2t_radio.hpp" // 引入射频 HAL 层
 
 std::vector<TrainState> fleet(5);
 std::vector<uint32_t> fleet_status(5, 0); 
@@ -28,7 +29,6 @@ void receive_forces_thread(int sd) {
             if (report.status_flag == 1) {
                 is_eb_locked[report.train_id] = true;
             }
-            
             if (is_eb_locked[report.train_id]) {
                 forces[report.train_id] = -1250000.0f; 
                 fleet_status[report.train_id] = 1;
@@ -65,20 +65,15 @@ int init_can_fd(const char* ifname) {
     int s;
     struct sockaddr_can addr;
     struct ifreq ifr;
-
     if ((s = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) return -1;
-
     int enable_canfd = 1;
     setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &enable_canfd, sizeof(enable_canfd));
-
     strcpy(ifr.ifr_name, ifname);
     ioctl(s, SIOCGIFINDEX, &ifr);
     memset(&addr, 0, sizeof(addr));
     addr.can_family = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
-    
     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-    
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) return -1;
     return s;
 }
@@ -102,6 +97,17 @@ int main() {
         fleet[i].smooth_brake_pressure = 0.0f;
     }
 
+    // ==========================================
+    // 窄带：T2T LoRa 射频初始化 (socat 虚拟串口)
+    // ==========================================
+    T2T_Radio t2t_radio;
+    if (!t2t_radio.init("/tmp/lora-server", B115200, 0x17)) {
+        std::cerr << "[SERVER] Error: 无法打开 /tmp/lora-server,请确认 socat 已运行！\n";
+    }
+
+    // ==========================================
+    // 宽带：Wi-Fi UDP 发送套接字初始化
+    // ==========================================
     int send_sd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in group_addr;
     memset(&group_addr, 0, sizeof(group_addr));
@@ -109,6 +115,7 @@ int main() {
     group_addr.sin_addr.s_addr = inet_addr(MULTICAST_GROUP);
     group_addr.sin_port = htons(MULTICAST_PORT);
 
+    // 回传 UI 接收套接字
     int recv_sd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));
@@ -147,7 +154,19 @@ int main() {
         }
 
         for (int i = 0; i < 5; ++i) {
-            if (i > 0) fleet[i].cmd_force = forces[i];
+            // ==========================================
+            // HIL 硬件隔离代管逻辑 (1,2,4为幽灵，3为真机)
+            // ==========================================
+            if (i == 3) {
+                fleet[i].cmd_force = forces[i]; // 听外部真实节点回报
+            } else if (i > 0) {
+                float ds = PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
+                float da = fleet[i-1].pos - fleet[i].pos;
+                float err = da - (ds + 30.0f);
+                float accel_cmd = err * 0.05f + (fleet[i-1].vel - fleet[i].vel) * 0.1f;
+                fleet[i].cmd_force = std::clamp(fleet[i].mass * accel_cmd, -1250000.0f, 1000000.0f);
+                fleet_status[i] = 0; 
+            }
 
             float v = fleet[i].vel;
             float res = (v > 0.1f) ? (18000.0f + 450.0f * v + 15.5f * v * v) : 0.0f;
@@ -181,11 +200,11 @@ int main() {
                 memcpy(frame_a.data, &path_a, 64);
                 memcpy(frame_b.data, &path_b, 64);
 
-                ssize_t ret_a = write(vcan0_fd, &frame_a, sizeof(struct canfd_frame));
-                ssize_t ret_b = write(vcan1_fd, &frame_b, sizeof(struct canfd_frame));
-                if (ret_a < 0 || ret_b < 0) {}
+                write(vcan0_fd, &frame_a, sizeof(struct canfd_frame));
+                write(vcan1_fd, &frame_b, sizeof(struct canfd_frame));
             }
 
+            // 发送射频与网络数据 (10Hz)
             if (step % 10 == 0) {
                 if (pkt_loss(gen) < 0.05) continue; 
 
@@ -195,25 +214,34 @@ int main() {
 
                 RawT2TPacket pkt = {(uint32_t)i, 0x55AA55AA, step, v_enc | (p_enc << 16) | (a_enc << 48), 0};
                 pkt.crc = _mm_crc32_u64(0, pkt.payload); 
+                
+                // 【核心：双链路发送模拟】
+                // 1. 发往虚拟串口 (LoRa)
+                t2t_radio.broadcast(pkt);
+                // 2. 发往 UDP (Wi-Fi 宽带)
                 sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
             }
         }
 
+        // UI 渲染
         if (step % 20 == 0) {
-            std::printf("\033[2J\033[H=== SD-VCU UDP AND SERIAL HARDWARE MONITOR ===\n");
-            std::printf("Sim Time: %7.2fs | Target Speed: 80km/h\n", elapsed);
+            std::printf("\033[2J\033[H=== SD-VCU HIL & DUAL-LINK MONITOR ===\n");
+            std::printf("Sim Time: %7.2fs | Dynamic Topology Active\n", elapsed);
             if (collision) std::printf(">>> CRITICAL ALARM: COLLISION DETECTED. FLEET HALTED. <<<\n");
-            std::printf("ID | TruePos(m)| TrueVel(km/h)|  Gap(m) | Safe(m) | Force(kN) | Status\n");
+            std::printf("ID | TruePos(m)| TrueVel(km/h)|  Gap(m) | Safe(m) | Force(kN) | State Machine Mode\n");
             for (int i = 0; i < 5; ++i) {
                 float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
                 float s_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
                 
-                // 【修复：UI界面状态颜色增强显示】
-                const char* status_str = "\033[32mOK\033[0m";
-                if (is_eb_locked[i]) {
-                    status_str = "\033[31mHW_FAULT\033[0m"; // 硬件熔断
-                } else if (fleet[i].cmd_force <= -1200000.0f) {
-                    status_str = "\033[33mATP_TRIP\033[0m"; // 距离超限ATP介入
+                const char* status_str = "\033[32mFOLLOWER (跟车/幽灵)\033[0m";
+                if (i == 0) {
+                    status_str = "\033[36mLEADER_A (全局头车)\033[0m";
+                } else if (fleet_status[i] == 1) {
+                    status_str = "\033[31mATP_TRIP (制动锁死)\033[0m"; 
+                } else if (fleet_status[i] == 2) {
+                    status_str = "\033[33mDECOUPLING (解散拉距)\033[0m"; 
+                } else if (fleet_status[i] == 3) {
+                    status_str = "\033[35mLEADER_B (独立新头车)\033[0m"; 
                 }
 
                 std::printf("[%d] |  %7.1f |    %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 

@@ -20,6 +20,7 @@ struct TrainState {
 
 enum class TrainType { LOCO_HAULED, EMU_DISTRIBUTED, HEAVY_HAUL };
 
+// 统一的物理传感数据结构
 struct alignas(64) SensorData {
     float distances[16]; 
 };
@@ -31,8 +32,8 @@ private:
     uint16_t last_seq;
     bool is_eb_triggered;
 
-    // 底层硬件指令封装
-    bool avx512_payload_match(const CANPacket& a, const CANPacket& b);
+    // 硬件冗余校验 直接对比纯物理内存块
+    bool avx512_payload_match(const SensorData& a, const SensorData& b);
 
 public:
     float current_safe_gap;
@@ -40,24 +41,37 @@ public:
 
     SDVCU_Core();
     
-    // 返回 true 表示数据健康，返回 false 表示触发了制动或外推
-    bool process_sensors(const CANPacket& path_a, const CANPacket& path_b, double mass);
+    // 大脑核心只接收干净的物理量 SensorData
+    bool process_sensors(uint16_t seq_num, const SensorData& path_a, const SensorData& path_b);
     
     bool is_eb() const;
     bool is_atp_braking(float gap) const;
 };
+
 class PerceptionEngine {
 public:
     static bool fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t& last_seq);
     
+    // 将 MVB 报文翻译为标准 SensorData
     static bool hardware_unpack(const MVB_Hardware_Frame& hw, SensorData& out) {
         if (hw.head[0] != 0xFE || hw.head[1] != 0xFA) return false;
         std::memset(&out, 0, sizeof(SensorData));
         
-        // [BUG FIX] Map speed to index 1 to match vcu_node's kf_my_vel expectation
-        out.distances[0] = 0.0f;                       // Absolute position (not provided by MVB)
-        out.distances[1] = hw.raw_speed / 100.0f;      // Velocity
-        out.distances[2] = hw.brake_press / 10.0f;     // Brake Cylinder Pressure
+        out.distances[0] = 0.0f;                       // Gap (MVB暂无)
+        out.distances[1] = hw.raw_speed / 100.0f;      // 本车速度
+        out.distances[2] = -1.0f;                      // 【修正】前车速度 (MVB无法提供，打上 -1 标记)
+        out.distances[3] = hw.brake_press / 10.0f;     // 【修正】管压挪到下标 3
+        return true;
+    }
+
+    // 将 CAN 报文翻译为标准 SensorData
+    static bool can_unpack(const CANPacket& can_pkt, SensorData& out) {
+        if (can_pkt.header != 0xAA55) return false; 
+        std::memset(&out, 0, sizeof(SensorData));
+        
+        out.distances[0] = can_pkt.payload[0]; // 雷达测得的间距 Gap
+        out.distances[1] = can_pkt.payload[1]; // 本车速度
+        out.distances[2] = can_pkt.payload[2]; // 前车速度/其他数据
         return true;
     }
 

@@ -15,7 +15,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include "perception.hpp"
-#include "t2t_radio.hpp" // 引入射频 HAL 层
+#include "t2t_radio.hpp"
 
 std::vector<TrainState> fleet(5);
 std::vector<uint32_t> fleet_status(5, 0); 
@@ -26,10 +26,8 @@ void receive_forces_thread(int sd) {
     ForceReportPacket report;
     while (recv(sd, &report, sizeof(report), 0) > 0) {
         if (report.train_id > 0 && report.train_id < 5) {
+            // 【核心修复】：移除 is_eb_locked 的永久锁死，改为动态状态跟随
             if (report.status_flag == 1) {
-                is_eb_locked[report.train_id] = true;
-            }
-            if (is_eb_locked[report.train_id]) {
                 forces[report.train_id] = -1250000.0f; 
                 fleet_status[report.train_id] = 1;
             } else {
@@ -39,7 +37,6 @@ void receive_forces_thread(int sd) {
         }
     }
 }
-
 void broadcast_hardware_signal(int fd, TrainState& state) {
     if (fd < 0) return;
     MVB_Hardware_Frame hw_frame;
@@ -82,11 +79,11 @@ int main() {
     int mvb_fd = open("/tmp/v-bus-m", O_RDWR | O_NOCTTY | O_NONBLOCK);
     int vcan0_fd = init_can_fd("vcan0");
     int vcan1_fd = init_can_fd("vcan1");
-    if(vcan0_fd < 0 || vcan1_fd < 0) std::cerr << "[SERVER] Warning: Virtual CAN interfaces not found." << std::endl;
-    if (mvb_fd < 0) std::cerr << "[SERVER] Warning: Virtual MVB Bus not found." << std::endl;
+    if(vcan0_fd < 0 || vcan1_fd < 0) std::cerr << "[SERVER] Warning: Virtual CAN interfaces not found.\n";
+    if (mvb_fd < 0) std::cerr << "[SERVER] Warning: Virtual MVB Bus not found.\n";
 
     std::ofstream log_file("fleet_log.csv");
-    log_file << "Time,ID,Pos,Vel,Gap,Safe,Force,BrakePress" << std::endl;
+    log_file << "Time,ID,Pos,Vel,Gap,Safe,Force,BrakePress\n";
 
     for(int i = 0; i < 5; i++) {
         fleet[i].id = i;
@@ -97,17 +94,11 @@ int main() {
         fleet[i].smooth_brake_pressure = 0.0f;
     }
 
-    // ==========================================
-    // 窄带：T2T LoRa 射频初始化 (socat 虚拟串口)
-    // ==========================================
     T2T_Radio t2t_radio;
     if (!t2t_radio.init("/tmp/lora-server", B115200, 0x17)) {
-        std::cerr << "[SERVER] Error: 无法打开 /tmp/lora-server,请确认 socat 已运行！\n";
+        std::cerr << "[SERVER] Error: Cannot open /tmp/lora-server\n";
     }
 
-    // ==========================================
-    // 宽带：Wi-Fi UDP 发送套接字初始化
-    // ==========================================
     int send_sd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in group_addr;
     memset(&group_addr, 0, sizeof(group_addr));
@@ -115,7 +106,6 @@ int main() {
     group_addr.sin_addr.s_addr = inet_addr(MULTICAST_GROUP);
     group_addr.sin_port = htons(MULTICAST_PORT);
 
-    // 回传 UI 接收套接字
     int recv_sd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));
@@ -143,22 +133,28 @@ int main() {
             if (fleet[i-1].pos - fleet[i].pos < -1.0) collision = true;
         }
 
-        if (collision) fleet[0].cmd_force = -1250000.0f; 
-        else {
-            if (elapsed < 5.0) fleet[0].cmd_force = 0.0f; 
-            else if (elapsed < 350.0) { 
-                if (fleet[0].vel < 22.22) fleet[0].cmd_force = 400000.0f; 
-                else if (fleet[0].vel > 22.3) fleet[0].cmd_force = -100000.0f;
-                else fleet[0].cmd_force = 60000.0f;
-            } else fleet[0].cmd_force = -1250000.0f;
+        // ==========================================
+        // 【核心修改】：全局头车平滑加速剧本
+        // ==========================================
+        if (collision) {
+            fleet[0].cmd_force = -1250000.0f; 
+        } else {
+            if (elapsed < 5.0) {
+                fleet[0].cmd_force = 0.0f; 
+            } else if (elapsed < 350.0) { 
+                // 平滑 PI 速度控制，目标 80 km/h (22.22 m/s)
+                float target_leader_v = 22.22f; 
+                float err = target_leader_v - fleet[0].vel;
+                float accel_cmd = err * 0.08f; 
+                fleet[0].cmd_force = std::clamp(fleet[0].mass * accel_cmd, -1250000.0f, 600000.0f);
+            } else {
+                fleet[0].cmd_force = -1250000.0f; // 最终大结局：集体紧急制动测试
+            }
         }
 
         for (int i = 0; i < 5; ++i) {
-            // ==========================================
-            // HIL 硬件隔离代管逻辑 (1,2,4为幽灵，3为真机)
-            // ==========================================
             if (i == 3) {
-                fleet[i].cmd_force = forces[i]; // 听外部真实节点回报
+                fleet[i].cmd_force = forces[i]; 
             } else if (i > 0) {
                 float ds = PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
                 float da = fleet[i-1].pos - fleet[i].pos;
@@ -181,7 +177,7 @@ int main() {
             
             log_file << elapsed << "," << i << "," << fleet[i].pos << "," << fleet[i].vel << "," 
                      << gap << "," << safe_dist << "," << fleet[i].cmd_force << "," 
-                     << fleet[i].smooth_brake_pressure << std::endl;
+                     << fleet[i].smooth_brake_pressure << "\n";
 
             if (i > 0) {
                 float front_v = fleet[i-1].vel;
@@ -204,7 +200,6 @@ int main() {
                 write(vcan1_fd, &frame_b, sizeof(struct canfd_frame));
             }
 
-            // 发送射频与网络数据 (10Hz)
             if (step % 10 == 0) {
                 if (pkt_loss(gen) < 0.05) continue; 
 
@@ -215,15 +210,11 @@ int main() {
                 RawT2TPacket pkt = {(uint32_t)i, 0x55AA55AA, step, v_enc | (p_enc << 16) | (a_enc << 48), 0};
                 pkt.crc = _mm_crc32_u64(0, pkt.payload); 
                 
-                // 【核心：双链路发送模拟】
-                // 1. 发往虚拟串口 (LoRa)
                 t2t_radio.broadcast(pkt);
-                // 2. 发往 UDP (Wi-Fi 宽带)
                 sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
             }
         }
 
-        // UI 渲染
         if (step % 20 == 0) {
             std::printf("\033[2J\033[H=== SD-VCU HIL & DUAL-LINK MONITOR ===\n");
             std::printf("Sim Time: %7.2fs | Dynamic Topology Active\n", elapsed);

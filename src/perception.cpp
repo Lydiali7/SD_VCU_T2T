@@ -4,11 +4,9 @@
 
 bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t& last_seq) {
     if (raw.header != 0x55AA55AA || raw.seq <= last_seq) return false;
-    
     if (_mm_crc32_u64(0, raw.payload) != raw.crc) return false;
 
     last_seq = raw.seq;
-
     uint16_t v_raw = raw.payload & 0xFFFF;
     uint32_t p_raw = (raw.payload >> 16) & 0xFFFFFFFF;
     int16_t a_raw = (int16_t)(raw.payload >> 48);
@@ -26,11 +24,8 @@ float PerceptionEngine::calculate_safe_dist(float v_s, float v_f, TrainType type
             float t_ecp = 0.4f;    
             float d_buffer = 150.0f; 
             
-            // 【修复点】：制动动能差如果为负，直接归 0。绝不能减损反应时间！
             float braking_diff = std::max(0.0f, (v_s * v_s - v_f * v_f) / (2.0f * a_limit));
             float reaction = v_s * t_ecp;
-            
-            // 安全距离 = 绝对裕量 + 空走反应距离 + 相对制动差
             return d_buffer + reaction + braking_diff;
         }
         case TrainType::EMU_DISTRIBUTED: {
@@ -61,17 +56,18 @@ SDVCU_Core::SDVCU_Core() :
     current_safe_gap(150.0f), 
     current_vel(0.0f) {}
 
-bool SDVCU_Core::avx512_payload_match(const CANPacket& a, const CANPacket& b) {
+// AVX-512 现在直接对比 64 字节的纯物理 SensorData
+bool SDVCU_Core::avx512_payload_match(const SensorData& a, const SensorData& b) {
     __m512i vec_a = _mm512_loadu_si512((const void*)&a);
     __m512i vec_b = _mm512_loadu_si512((const void*)&b);
     __mmask16 mismatch_mask = _mm512_cmpneq_epi32_mask(vec_a, vec_b);
     return (mismatch_mask == 0);
 }
 
-bool SDVCU_Core::process_sensors(const CANPacket& path_a, const CANPacket& path_b, double mass) {
+bool SDVCU_Core::process_sensors(uint16_t seq_num, const SensorData& path_a, const SensorData& path_b) {
     if (is_eb_triggered) return false;
 
-    if (path_a.header != 0xAA55 || path_a.seq_num <= last_seq) {
+    if (seq_num != 0 && seq_num <= last_seq) {
         consecutive_errors++;
     } 
     else if (!avx512_payload_match(path_a, path_b)) {
@@ -80,13 +76,15 @@ bool SDVCU_Core::process_sensors(const CANPacket& path_a, const CANPacket& path_
     } 
     else {
         consecutive_errors = 0; 
-        last_seq = path_a.seq_num;
+        if (seq_num != 0) last_seq = seq_num;
         
-        float distance_to_obstacle = path_a.payload[0]; 
-        current_vel = path_a.payload[1]; 
-        float front_vel = path_a.payload[2]; // 读取雷达测得的前车速度
-        
-        // 底层的硬件级 ATP 也全面采用相对安全动能包络
+        float distance_to_obstacle = path_a.distances[0]; 
+        current_vel = path_a.distances[1]; 
+        float front_vel = path_a.distances[2]; 
+
+        if (front_vel < 0.0f) {
+            front_vel = current_vel; // 假设前车与本车同速，不产生额外制动差
+        }
         float a_limit = 0.25f; 
         float t_ecp = 0.4f;
         float d_buffer = 150.0f;
@@ -94,12 +92,10 @@ bool SDVCU_Core::process_sensors(const CANPacket& path_a, const CANPacket& path_
         float braking_diff = std::max(0.0f, (current_vel * current_vel - front_vel * front_vel) / (2.0f * a_limit));
         current_safe_gap = d_buffer + (current_vel * t_ecp) + braking_diff; 
         
-        // ==========================================
-        // 【核心修复】：硬件级 ATP 越界必须强行锁死！
-        // ==========================================
-        if (distance_to_obstacle < current_safe_gap) {
+        // 只有当提供了有效的雷达距离(>0)时才触发硬件 ATP
+        if (distance_to_obstacle > 0.1f && distance_to_obstacle < current_safe_gap) {
             std::cout << "\n[PERCEPTION_FATAL] Hardware ATP Trip! Radar detected Gap < Safe. Triggering EB Lock!\n";
-            is_eb_triggered = true; // 真正拉下物理紧急制动的关键一行
+            is_eb_triggered = true; 
             return false; 
         }
     }

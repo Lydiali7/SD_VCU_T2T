@@ -26,7 +26,6 @@ void receive_forces_thread(int sd) {
     ForceReportPacket report;
     while (recv(sd, &report, sizeof(report), 0) > 0) {
         if (report.train_id > 0 && report.train_id < 5) {
-            // 【核心修复】：移除 is_eb_locked 的永久锁死，改为动态状态跟随
             if (report.status_flag == 1) {
                 forces[report.train_id] = -1250000.0f; 
                 fleet_status[report.train_id] = 1;
@@ -37,6 +36,7 @@ void receive_forces_thread(int sd) {
         }
     }
 }
+
 void broadcast_hardware_signal(int fd, TrainState& state) {
     if (fd < 0) return;
     MVB_Hardware_Frame hw_frame;
@@ -126,6 +126,14 @@ int main() {
     uint32_t step = 0;
     auto start_time = std::chrono::steady_clock::now();
 
+    // ==========================================
+    // 【新增】：服务器端基于状态的故障注入观测器
+    // ==========================================
+    double server_cruise_start_time = -1.0;
+    double tunnel_start_time = -1.0;
+    bool tunnel_active = false;
+    bool tunnel_completed = false; // 保证整场测试只触发一次隧道
+
     while (true) {
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         bool collision = false;
@@ -133,22 +141,39 @@ int main() {
             if (fleet[i-1].pos - fleet[i].pos < -1.0) collision = true;
         }
 
-        // ==========================================
-        // 【核心修改】：全局头车平滑加速剧本
-        // ==========================================
+        // 1. 观测器：如果头车和 2 号车都达到了 21.5 m/s (约 77km/h)
+        bool is_fleet_cruising = (fleet[0].vel > 21.5 && fleet[2].vel > 21.5);
+
+        if (is_fleet_cruising && !tunnel_completed) {
+            if (server_cruise_start_time < 0.0) {
+                server_cruise_start_time = elapsed; // 开始计时
+            } else if (elapsed - server_cruise_start_time > 10.0 && !tunnel_active) {
+                // 稳定跑满 10 秒，触发断网隧道事件！
+                tunnel_active = true;
+                tunnel_start_time = elapsed;
+            }
+        } else if (!tunnel_active && !tunnel_completed) {
+            server_cruise_start_time = -1.0; // 如果还没进隧道就掉速了，重新计时
+        }
+
+        // 隧道持续 30 秒后结束
+        if (tunnel_active && (elapsed - tunnel_start_time > 30.0)) {
+            tunnel_active = false;
+            tunnel_completed = true;
+        }
+
         if (collision) {
             fleet[0].cmd_force = -1250000.0f; 
         } else {
             if (elapsed < 5.0) {
                 fleet[0].cmd_force = 0.0f; 
-            } else if (elapsed < 350.0) { 
-                // 平滑 PI 速度控制，目标 80 km/h (22.22 m/s)
+            } else if (elapsed < 600.0) { // 稍微放宽测试总时间
                 float target_leader_v = 22.22f; 
                 float err = target_leader_v - fleet[0].vel;
-                float accel_cmd = err * 0.08f; 
-                fleet[0].cmd_force = std::clamp(fleet[0].mass * accel_cmd, -1250000.0f, 600000.0f);
+                float accel_cmd = err * 0.15f; 
+                fleet[0].cmd_force = std::clamp(fleet[0].mass * accel_cmd, -1250000.0f, 800000.0f);
             } else {
-                fleet[0].cmd_force = -1250000.0f; // 最终大结局：集体紧急制动测试
+                fleet[0].cmd_force = -1250000.0f; 
             }
         }
 
@@ -211,28 +236,40 @@ int main() {
                 pkt.crc = _mm_crc32_u64(0, pkt.payload); 
                 
                 t2t_radio.broadcast(pkt);
-                sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
+
+                // 只有隧道未激活，或者发送给不是 3号车 的数据，才走宽带 UDP
+                bool in_tunnel_jamming = tunnel_active && (i == 2);
+                
+                if (!in_tunnel_jamming) {
+                    sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
+                }
             }
         }
 
         if (step % 20 == 0) {
             std::printf("\033[2J\033[H=== SD-VCU HIL & DUAL-LINK MONITOR ===\n");
             std::printf("Sim Time: %7.2fs | Dynamic Topology Active\n", elapsed);
+            
             if (collision) std::printf(">>> CRITICAL ALARM: COLLISION DETECTED. FLEET HALTED. <<<\n");
+            
+            if (tunnel_active) {
+                std::printf("\033[41;37m [! EVENT !] TUNNEL JAMMING ACTIVE: V2V UDP NETWORK DISCONNECTED \033[0m\n");
+            }
+
             std::printf("ID | TruePos(m)| TrueVel(km/h)|  Gap(m) | Safe(m) | Force(kN) | State Machine Mode\n");
             for (int i = 0; i < 5; ++i) {
                 float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
                 float s_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
                 
-                const char* status_str = "\033[32mFOLLOWER (跟车/幽灵)\033[0m";
+                const char* status_str = "\033[32mFOLLOWER\033[0m";
                 if (i == 0) {
-                    status_str = "\033[36mLEADER_A (全局头车)\033[0m";
+                    status_str = "\033[36mLEADER_A\033[0m";
                 } else if (fleet_status[i] == 1) {
-                    status_str = "\033[31mATP_TRIP (制动锁死)\033[0m"; 
+                    status_str = "\033[31mATP_TRIP\033[0m"; 
                 } else if (fleet_status[i] == 2) {
-                    status_str = "\033[33mDECOUPLING (解散拉距)\033[0m"; 
+                    status_str = "\033[33mDECOUPLING\033[0m"; 
                 } else if (fleet_status[i] == 3) {
-                    status_str = "\033[35mLEADER_B (独立新头车)\033[0m"; 
+                    status_str = "\033[35mLEADER_B\033[0m"; 
                 }
 
                 std::printf("[%d] |  %7.1f |    %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 

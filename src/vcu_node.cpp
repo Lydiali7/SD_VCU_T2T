@@ -142,11 +142,25 @@ int main(int argc, char* argv[]) {
         }
 
         // 2. Trigger decoupling if stable for 10 seconds
+        /*
         if (id == 3 && current_state == PlatoonState::FOLLOWER && !decoupling_triggered && is_cruising) {
             if (elapsed - cruise_start_time > 10.0) {
                 current_state = PlatoonState::DECOUPLING;
                 decoupling_triggered = true;
                 std::cout << "\n[DISPATCH] Fleet stably cruised at 80km/h for 10s. VCU 3 initiating DECOUPLING! Target gap: 800m.\n";
+                i_err = 0.0f; 
+            }
+        }
+        */
+        // 2. 触发：处于跟车模式 + 没有触发过解编 + 稳定巡航超过 50 秒 (预留隧道时间)
+        if (id == 3 && current_state == PlatoonState::FOLLOWER && !decoupling_triggered && is_cruising) {
+            // 【核心修改】：等待 50 秒！因为中间有 30 秒会经历隧道断网考验。
+            // 如果 50 秒后依然能触发，说明这 50 秒内，即使经历了 30 秒的宽带断连，
+            // 依靠 LoRa 窄带传输的数据依然支撑了系统不掉速、不崩溃！
+            if (elapsed - cruise_start_time > 50.0) {
+                current_state = PlatoonState::DECOUPLING;
+                decoupling_triggered = true;
+                std::cout << "\n\033[35m[DISPATCH] Fleet cruised & survived tunnel. VCU 3 initiating DECOUPLING!\033[0m\n";
                 i_err = 0.0f; 
             }
         }

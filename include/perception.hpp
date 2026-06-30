@@ -6,6 +6,17 @@
 #include <algorithm>
 #include <cstring>
 #include "network_proto.hpp"
+#include "train_dynamics.hpp"
+
+// =========================================================
+// 1. Legacy & Compatibility Definitions 
+// =========================================================
+enum class TrainType {
+    DF4D,
+    DF8B,
+    HXN3,
+    EMU_DISTRIBUTED
+};
 
 struct TrainState {
     int id;
@@ -13,68 +24,91 @@ struct TrainState {
     double vel;         
     double accel;       
     float cmd_force;    
-    float mass = 5000000.0f; 
+    float mass; 
     float smooth_brake_pressure = 0.0f; 
     uint16_t lora_target_addr = 0xFFFF;
 };
 
-enum class TrainType { LOCO_HAULED, EMU_DISTRIBUTED, HEAVY_HAUL };
-
-// 统一的物理传感数据结构
+// =========================================================
+// 2. Hardware Accelerated Perception Structures
+// =========================================================
 struct alignas(64) SensorData {
     float distances[16]; 
 };
 
+// =========================================================
+// 3. Kalman Filter for Tunnel Blind Run
+// =========================================================
+class KalmanTracker {
+public:
+    float pos;
+    float vel;
+    float p_err;
+    float v_err;
+
+    KalmanTracker(float init_p, float init_v) 
+        : pos(init_p), vel(init_v), p_err(10.0f), v_err(2.0f) {}
+
+    void predict(float dt) {
+        pos += vel * dt;
+        p_err += 5.0f * dt; 
+        v_err += 1.0f * dt;
+    }
+
+    void update(float meas_p, float meas_v) {
+        float k_p = p_err / (p_err + 20.0f); 
+        pos = pos + k_p * (meas_p - pos);
+        p_err = (1.0f - k_p) * p_err;
+
+        float k_v = v_err / (v_err + 5.0f);  
+        vel = vel + k_v * (meas_v - vel);
+        v_err = (1.0f - k_v) * v_err;
+    }
+};
+
+// =========================================================
+// 4. Core Logic & Math Engines
+// =========================================================
 class SDVCU_Core {
 private:
     int consecutive_errors;
     const int ERROR_THRESHOLD = 3; 
     uint16_t last_seq;
     bool is_eb_triggered;
+    
+    LocoModel my_loco_model;
+    LocoModel front_loco_model;
+    int num_wagons;
 
-    // 硬件冗余校验 直接对比纯物理内存块
-    bool avx512_payload_match(const SensorData& a, const SensorData& b);
+    bool avx2_payload_match(const SensorData& a, const SensorData& b);
 
 public:
     float current_safe_gap;
     float current_vel;
 
-    SDVCU_Core();
+    SDVCU_Core(LocoModel me, LocoModel front, int wagons);
     
-    // 大脑核心只接收干净的物理量 SensorData
-    bool process_sensors(uint16_t seq_num, const SensorData& path_a, const SensorData& path_b);
+    bool process_sensors(uint16_t seq_num, const SensorData& path_a, const SensorData& path_b, 
+                         uint64_t ts_a_us, uint64_t ts_b_us, float current_aoi_s);
     
     bool is_eb() const;
-    bool is_atp_braking(float gap) const;
+    void force_eb_trigger();
 };
 
 class PerceptionEngine {
 public:
     static bool fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t& last_seq);
     
-    // 将 MVB 报文翻译为标准 SensorData
-    static bool hardware_unpack(const MVB_Hardware_Frame& hw, SensorData& out) {
-        if (hw.head[0] != 0xFE || hw.head[1] != 0xFA) return false;
-        std::memset(&out, 0, sizeof(SensorData));
-        
-        out.distances[0] = 0.0f;                       // Gap (MVB暂无)
-        out.distances[1] = hw.raw_speed / 100.0f;      // 本车速度
-        out.distances[2] = -1.0f;                      // 【修正】前车速度 (MVB无法提供，打上 -1 标记)
-        out.distances[3] = hw.brake_press / 10.0f;     // 【修正】管压挪到下标 3
-        return true;
-    }
+    // [MODIFIED] Added current_gradient_permille for topography awareness
+    static float calculate_heavy_haul_safe_dist(
+        float v_rear_mps, float v_front_mps, 
+        LocoModel rear_model, LocoModel front_model, 
+        const WagonProfile& rear_wagon, const WagonProfile& front_wagon,
+        int rear_num, int front_num, 
+        bool is_ecp_active, float actual_comm_delay_s,
+        float current_gradient_permille = 0.0f); 
+    
+    static float get_packet_error_rate(float distance_m, bool is_in_tunnel);
 
-    // 将 CAN 报文翻译为标准 SensorData
-    static bool can_unpack(const CANPacket& can_pkt, SensorData& out) {
-        if (can_pkt.header != 0xAA55) return false; 
-        std::memset(&out, 0, sizeof(SensorData));
-        
-        out.distances[0] = can_pkt.payload[0]; // 雷达测得的间距 Gap
-        out.distances[1] = can_pkt.payload[1]; // 本车速度
-        out.distances[2] = can_pkt.payload[2]; // 前车速度/其他数据
-        return true;
-    }
-
-    static float calculate_safe_dist(float v_s, float v_f, TrainType type);
-    static bool is_system_safe(const SensorData& pathA, const SensorData& pathB);
+    static float calculate_safe_dist(float v_rear_mps, float v_front_mps, TrainType type);
 };

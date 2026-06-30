@@ -8,277 +8,249 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <chrono>
-#include <random>
-#include <nmmintrin.h>
-#include <linux/can.h>
-#include <linux/can/raw.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
+#include <algorithm>
 #include "perception.hpp"
-#include "t2t_radio.hpp"
+#include "train_dynamics.hpp"
 
 std::vector<TrainState> fleet(5);
 std::vector<uint32_t> fleet_status(5, 0); 
 float forces[5] = {0}; 
-bool is_eb_locked[5] = {false}; 
+
+struct sockaddr_in active_client_addr;
+bool client_connected = false;
+
+// Global state trackers for legacy simulated nodes
+float post_tunnel_steady[5] = {0.0f};
+bool tunnel_exit[5] = {false};
 
 void receive_forces_thread(int sd) {
     ForceReportPacket report;
-    while (recv(sd, &report, sizeof(report), 0) > 0) {
-        if (report.train_id > 0 && report.train_id < 5) {
-            if (report.status_flag == 1) {
-                forces[report.train_id] = -1250000.0f; 
-                fleet_status[report.train_id] = 1;
-            } else {
-                forces[report.train_id] = report.cmd_force; 
-                fleet_status[report.train_id] = report.status_flag;
-            }
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    while (recvfrom(sd, &report, sizeof(report), 0, (struct sockaddr*)&client_addr, &client_len) > 0) {
+        int idx = report.train_id; 
+        if (idx == 3) { 
+            forces[idx] = (report.status_flag == 1) ? -5000000.0f : report.cmd_force; 
+            fleet_status[idx] = report.status_flag; 
+            active_client_addr = client_addr;
+            client_connected = true;
         }
     }
-}
-
-void broadcast_hardware_signal(int fd, TrainState& state) {
-    if (fd < 0) return;
-    MVB_Hardware_Frame hw_frame;
-    std::memset(&hw_frame, 0, sizeof(hw_frame));
-    
-    hw_frame.head[0] = 0xFE; 
-    hw_frame.head[1] = 0xFA;
-    hw_frame.cmd_type = 0x05; 
-    hw_frame.port_addr = (uint8_t)state.id;
-    
-    float target_pressure = std::abs(state.cmd_force / 10000.0f);
-    state.smooth_brake_pressure += (target_pressure - state.smooth_brake_pressure) * 0.05f; 
-
-    hw_frame.raw_speed = static_cast<uint16_t>(state.vel * 100.0f);
-    hw_frame.brake_press = static_cast<uint16_t>(state.smooth_brake_pressure * 10.0f);
-    hw_frame.io_status = fleet_status[state.id];
-
-    ssize_t ret = write(fd, &hw_frame, sizeof(hw_frame));
-    if (ret < 0) {}
-}
-
-int init_can_fd(const char* ifname) {
-    int s;
-    struct sockaddr_can addr;
-    struct ifreq ifr;
-    if ((s = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) return -1;
-    int enable_canfd = 1;
-    setsockopt(s, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &enable_canfd, sizeof(enable_canfd));
-    strcpy(ifr.ifr_name, ifname);
-    ioctl(s, SIOCGIFINDEX, &ifr);
-    memset(&addr, 0, sizeof(addr));
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) return -1;
-    return s;
 }
 
 int main() {
-    int mvb_fd = open("/tmp/v-bus-m", O_RDWR | O_NOCTTY | O_NONBLOCK);
-    int vcan0_fd = init_can_fd("vcan0");
-    int vcan1_fd = init_can_fd("vcan1");
-    if(vcan0_fd < 0 || vcan1_fd < 0) std::cerr << "[SERVER] Warning: Virtual CAN interfaces not found.\n";
-    if (mvb_fd < 0) std::cerr << "[SERVER] Warning: Virtual MVB Bus not found.\n";
+    std::cout << "[SERVER] Booting Heterogeneous World Simulation...\n";
+    int server_sd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(VCU_REPORT_PORT);
+    bind(server_sd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    //int flags = fcntl(server_sd, F_GETFL, 0);
+    //fcntl(server_sd, F_SETFL, flags | O_NONBLOCK);
+
+    std::thread rx_thread(receive_forces_thread, server_sd);
+    rx_thread.detach();
 
     std::ofstream log_file("fleet_log.csv");
-    log_file << "Time,ID,Pos,Vel,Gap,Safe,Force,BrakePress\n";
+    log_file << "Time(s),ID0_Pos,ID0_Vel,ID0_F,ID0_St,ID1_Pos,ID1_Vel,ID1_F,ID1_St,ID2_Pos,ID2_Vel,ID2_F,ID2_St,ID3_Pos,ID3_Vel,ID3_F,ID3_St,ID4_Pos,ID4_Vel,ID4_F,ID4_St\n";
 
-    for(int i = 0; i < 5; i++) {
-        fleet[i].id = i;
-        fleet[i].mass = 5000000.0f;
-        fleet[i].pos = 10000.0 - i * 200.0; 
-        fleet[i].vel = 0.0;
-        fleet[i].cmd_force = 0.0;
-        fleet[i].smooth_brake_pressure = 0.0f;
+    for (int i = 0; i < 5; ++i) {
+        fleet[i].pos = (4 - i) * 1000.0f + 1000.0f; 
+        fleet[i].vel = 0.0f;
     }
 
-    T2T_Radio t2t_radio;
-    if (!t2t_radio.init("/tmp/lora-server", B115200, 0x17)) {
-        std::cerr << "[SERVER] Error: Cannot open /tmp/lora-server\n";
-    }
-
-    int send_sd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in group_addr;
-    memset(&group_addr, 0, sizeof(group_addr));
-    group_addr.sin_family = AF_INET;
-    group_addr.sin_addr.s_addr = inet_addr(MULTICAST_GROUP);
-    group_addr.sin_port = htons(MULTICAST_PORT);
-
-    int recv_sd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in srv_addr;
-    memset(&srv_addr, 0, sizeof(srv_addr));
-    srv_addr.sin_family = AF_INET;
-    srv_addr.sin_addr.s_addr = INADDR_ANY;
-    srv_addr.sin_port = htons(VCU_REPORT_PORT);
-    bind(recv_sd, (struct sockaddr*)&srv_addr, sizeof(srv_addr));
-    std::thread(receive_forces_thread, recv_sd).detach();
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::normal_distribution<double> pos_noise(0.0, 1.5);   
-    std::normal_distribution<double> vel_noise(0.0, 0.8);   
-    std::normal_distribution<double> accel_noise(0.0, 0.2); 
-    std::uniform_real_distribution<double> pkt_loss(0.0, 1.0);
-
-    const double dt = 0.01;
-    uint32_t step = 0;
     auto start_time = std::chrono::steady_clock::now();
-
-    // ==========================================
-    // 【新增】：服务器端基于状态的故障注入观测器
-    // ==========================================
-    double server_cruise_start_time = -1.0;
-    double tunnel_start_time = -1.0;
-    bool tunnel_active = false;
-    bool tunnel_completed = false; // 保证整场测试只触发一次隧道
+    float dt = 0.01f; 
 
     while (true) {
-        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
-        bool collision = false;
-        for (int i = 1; i < 5; ++i) {
-            if (fleet[i-1].pos - fleet[i].pos < -1.0) collision = true;
-        }
+        auto current_time = std::chrono::steady_clock::now();
+        float elapsed_s = std::chrono::duration<float>(current_time - start_time).count();
 
-        // 1. 观测器：如果头车和 2 号车都达到了 21.5 m/s (约 77km/h)
-        bool is_fleet_cruising = (fleet[0].vel > 21.5 && fleet[2].vel > 21.5);
-
-        if (is_fleet_cruising && !tunnel_completed) {
-            if (server_cruise_start_time < 0.0) {
-                server_cruise_start_time = elapsed; // 开始计时
-            } else if (elapsed - server_cruise_start_time > 10.0 && !tunnel_active) {
-                // 稳定跑满 10 秒，触发断网隧道事件！
-                tunnel_active = true;
-                tunnel_start_time = elapsed;
-            }
-        } else if (!tunnel_active && !tunnel_completed) {
-            server_cruise_start_time = -1.0; // 如果还没进隧道就掉速了，重新计时
-        }
-
-        // 隧道持续 30 秒后结束
-        if (tunnel_active && (elapsed - tunnel_start_time > 30.0)) {
-            tunnel_active = false;
-            tunnel_completed = true;
-        }
-
-        if (collision) {
-            fleet[0].cmd_force = -1250000.0f; 
-        } else {
-            if (elapsed < 5.0) {
-                fleet[0].cmd_force = 0.0f; 
-            } else if (elapsed < 600.0) { // 稍微放宽测试总时间
-                float target_leader_v = 22.22f; 
-                float err = target_leader_v - fleet[0].vel;
-                float accel_cmd = err * 0.15f; 
-                fleet[0].cmd_force = std::clamp(fleet[0].mass * accel_cmd, -1250000.0f, 800000.0f);
-            } else {
-                fleet[0].cmd_force = -1250000.0f; 
-            }
-        }
-
+        std::printf("\033[2J\033[H");
+        std::printf("=== HETEROGENEOUS PLATOON WORLD SERVER ===\n");
+        std::printf("ID | TruePos(m)| TrueVel(km/h)|  Gap(m) | Safe(m) | Force(kN) | Current Status\n");
+        
         for (int i = 0; i < 5; ++i) {
-            if (i == 3) {
-                fleet[i].cmd_force = forces[i]; 
-            } else if (i > 0) {
-                float ds = PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
-                float da = fleet[i-1].pos - fleet[i].pos;
-                float err = da - (ds + 30.0f);
-                float accel_cmd = err * 0.05f + (fleet[i-1].vel - fleet[i].vel) * 0.1f;
-                fleet[i].cmd_force = std::clamp(fleet[i].mass * accel_cmd, -1250000.0f, 1000000.0f);
-                fleet_status[i] = 0; 
+            TrainConfig cfg = get_fleet_config(i);
+            LocomotiveProfile my_profile = FleetDatabase::get_loco_profile(cfg.model);
+            WagonProfile my_wagon = cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
+            float total_mass = my_profile.mass_kg + (cfg.num_wagons * my_wagon.gross_mass_kg);
+            float train_len = 22.0f + cfg.num_wagons * my_wagon.length_m; 
+            
+            float s_dist = 0.0f;
+            if (i > 0) {
+                TrainConfig front_cfg = get_fleet_config(i-1);
+                WagonProfile front_wagon = front_cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
+                s_dist = PerceptionEngine::calculate_heavy_haul_safe_dist(
+                                fleet[i].vel, fleet[i-1].vel, cfg.model, front_cfg.model, 
+                                my_wagon, front_wagon, cfg.num_wagons, front_cfg.num_wagons, false, 0.05f);
             }
 
-            float v = fleet[i].vel;
-            float res = (v > 0.1f) ? (18000.0f + 450.0f * v + 15.5f * v * v) : 0.0f;
-            fleet[i].accel = (fleet[i].cmd_force - res) / fleet[i].mass;
-            fleet[i].vel = std::max(0.0, fleet[i].vel + fleet[i].accel * dt);
+            // Real Track Topography Profile
+            float gradient_permille = 0.0f;
+            float curve_radius_m = 0.0f; 
+
+            if (fleet[i].pos > 8000.0f && fleet[i].pos <= 10000.0f) {
+                gradient_permille = -4.0f; 
+            } else if (fleet[i].pos > 10000.0f && fleet[i].pos < 12000.0f) {
+                gradient_permille = -4.0f; 
+                curve_radius_m = 400.0f;   
+            } else if (fleet[i].pos > 12000.0f && fleet[i].pos < 15000.0f) {
+                gradient_permille = 6.0f;
+            }
+
+            float curve_resistance_permille = 0.0f;
+            if (curve_radius_m > 0.1f) {
+                curve_resistance_permille = 600.0f / curve_radius_m;
+            }
+
+            float effective_gradient = gradient_permille + curve_resistance_permille;
+            float f_gravity = -total_mass * 9.8f * (effective_gradient / 1000.0f);
+
+            if (i != 3) { 
+                float gap = (i == 0) ? 9999.0f : (fleet[i-1].pos - fleet[i].pos - train_len);
+                float target_net_f = 0.0f; 
+                
+                if (fleet[i].vel > 25.0f) { 
+                    target_net_f = -total_mass * 0.4f; 
+                } else {
+                    if (i == 0) {
+                        float err_v = (88.2f / 3.6f) - fleet[0].vel; 
+                        target_net_f = err_v * 50000.0f;
+                    } else {
+                        if (fleet_status[i] == 4) {
+                            // FIX 1: Gradient Decoupling Speeds to prevent rear-ending
+                            float decoupling_target_v = 24.5f - i * 3.5f; 
+                            float err_v = decoupling_target_v - fleet[i].vel; 
+                            target_net_f = err_v * 50000.0f;
+                            
+                            // FIX 2: State Machine Completion
+                            float v_diff = fleet[i-1].vel - fleet[i].vel;
+                            if (gap > 900.0f && v_diff > 3.0f) {
+                                fleet_status[i] = 5; 
+                            }
+                        } else {
+                            float target_gap;
+                            if (fleet_status[i] == 5) {
+                                // FIX 3: Eradicate the 1100m hardcode for tracking
+                                target_gap = std::max(850.0f, s_dist + 100.0f);
+                            } else {
+                                target_gap = s_dist + 80.0f; 
+                            }
+                            
+                            float err_p = gap - target_gap; 
+                            float err_v = fleet[i-1].vel - fleet[i].vel;
+                            float cruise_force = ((88.2f / 3.6f) - fleet[i].vel) * 50000.0f;
+                            float follow_force = (err_p * 15000.0f) + (err_v * 80000.0f);
+                            
+                            if (gap < 2500.0f) {
+                                target_net_f = std::min(cruise_force, follow_force);
+                            } else {
+                                target_net_f = cruise_force;
+                            }
+                        }
+                    }
+                    if (fleet[i].vel > 24.0f && target_net_f > 0.0f) target_net_f = 0.0f;
+                }
+
+                // Decoupling trigger for legacy nodes
+                if (fleet[i].pos > 7000.0f) {
+                    tunnel_exit[i] = true;
+                }
+                if (tunnel_exit[i] && fleet_status[i] == 0) {
+                    post_tunnel_steady[i] += fleet[i].vel * dt;
+                }
+                if (post_tunnel_steady[i] > 1000.0f && fleet_status[i] == 0 && i != 0) {
+                    fleet_status[i] = 4; // Safely enter DECOUPLING state
+                }
+
+                if (i < 4) {
+                    bool follower_is_gone = (fleet_status[i+1] >= 4 || fleet_status[i+1] == 1);
+                    if (!follower_is_gone) {
+                        TrainConfig back_cfg = get_fleet_config(i + 1);
+                        WagonProfile back_wagon = back_cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
+                        float back_len = 22.0f + back_cfg.num_wagons * back_wagon.length_m;
+                        float gap_to_follower = fleet[i].pos - fleet[i+1].pos - back_len;
+
+                        // Relaxed elastic thresholds to absorb blind-run buffering
+                        if (gap_to_follower > 1300.0f) target_net_f = -total_mass * 0.05f; 
+                        else if (gap_to_follower > 1150.0f && target_net_f > 0.0f) target_net_f = 0.0f; 
+                    }
+                }
+
+                if (i != 0 && gap > 0.1f && gap < s_dist) fleet_status[i] = 1; 
+                if (fleet_status[i] == 1) target_net_f = -total_mass * my_profile.avg_deceleration_limit; 
+
+                float target_motor_f = target_net_f - f_gravity;
+                float max_f = my_profile.max_starting_tractive_effort_n;
+                float min_f = -total_mass * my_profile.avg_deceleration_limit;
+                
+                forces[i] = std::clamp(target_motor_f, min_f, max_f);
+            }
+
+            float net_physical_force = forces[i] + f_gravity;
+            fleet[i].accel = net_physical_force / total_mass;
+            fleet[i].vel += fleet[i].accel * dt;
+            if (fleet[i].vel < 0.0f) fleet[i].vel = 0.0f;
             fleet[i].pos += fleet[i].vel * dt;
 
-            broadcast_hardware_signal(mvb_fd, fleet[i]);
-
-            float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
-            float safe_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
+            float gap = (i == 0) ? 0.0f : (fleet[i-1].pos - fleet[i].pos - train_len);
+            if (gap < 0.0f && i != 0) gap = 0.0f;
             
-            log_file << elapsed << "," << i << "," << fleet[i].pos << "," << fleet[i].vel << "," 
-                     << gap << "," << safe_dist << "," << fleet[i].cmd_force << "," 
-                     << fleet[i].smooth_brake_pressure << "\n";
+            const char* status_str = "\033[32mFOLLOWER(5G)\033[0m";
+            if (i == 0) status_str = "\033[36mLEADER_A\033[0m";
+            else if (fleet_status[i] == 1) status_str = "\033[31mATP_TRIP(EB)\033[0m"; 
+            else if (fleet_status[i] == 2) status_str = "\033[33mDEGRADED(Uu)\033[0m"; 
+            else if (fleet_status[i] == 3) status_str = "\033[35mBLIND_RUN(KF)\033[0m"; 
+            else if (fleet_status[i] == 4) status_str = "\033[34mDECOUPLING\033[0m"; 
+            else if (fleet_status[i] == 5) status_str = "\033[36mTRACKING(>1km)\033[0m"; 
+            
+            std::printf("%d  | %8.1f  | %9.2f    | %7.1f | %7.1f | %9.1f | %s\n", 
+                        i, fleet[i].pos, fleet[i].vel * 3.6f, gap, s_dist, forces[i]/1000.0f, status_str);
+        }
 
-            if (i > 0) {
-                float front_v = fleet[i-1].vel;
-                CANPacket path_a = {0xAA55, (uint16_t)i, (uint16_t)step, {gap, v, front_v, 0}, 0xFFFF, 0};
-                CANPacket path_b = path_a;
+        if (client_connected) {
+            TrainConfig cfg = get_fleet_config(3);
+            WagonProfile my_wagon = cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
+            float train_len = 22.0f + cfg.num_wagons * my_wagon.length_m; 
+            
+            float true_gap = fleet[2].pos - fleet[3].pos - train_len;
+            if (true_gap < 0.0f) true_gap = 0.0f; 
+            float true_front_vel = fleet[2].vel;
+            
+            float my_pos = fleet[3].pos;
+            bool in_tunnel = (my_pos > 5000.0f && my_pos < 7000.0f);
+            bool nlos_curve = (my_pos > 10000.0f && my_pos < 11000.0f);
 
-                struct canfd_frame frame_a, frame_b;
-                memset(&frame_a, 0, sizeof(frame_a));
-                memset(&frame_b, 0, sizeof(frame_b));
+            bool link_active = true;
+            uint64_t simulated_latency_us = 0;
 
-                frame_a.can_id = i; 
-                frame_b.can_id = i;
-                frame_a.len = 64;   
-                frame_b.len = 64;
-
-                memcpy(frame_a.data, &path_a, 64);
-                memcpy(frame_b.data, &path_b, 64);
-
-                write(vcan0_fd, &frame_a, sizeof(struct canfd_frame));
-                write(vcan1_fd, &frame_b, sizeof(struct canfd_frame));
+            if (in_tunnel) {
+                link_active = false;
+            } else if (nlos_curve) {
+                simulated_latency_us = 45000; 
+            } else {
+                simulated_latency_us = 4000; 
             }
 
-            if (step % 10 == 0) {
-                if (pkt_loss(gen) < 0.05) continue; 
-
-                uint64_t v_enc = (uint64_t)((std::max(0.0, fleet[i].vel + vel_noise(gen))) * 100.0);
-                uint64_t p_enc = (uint64_t)((fleet[i].pos + pos_noise(gen)) * 100.0);
-                uint64_t a_enc = (uint64_t)((uint16_t)(int16_t)((fleet[i].accel + accel_noise(gen)) * 100.0));
-
-                RawT2TPacket pkt = {(uint32_t)i, 0x55AA55AA, step, v_enc | (p_enc << 16) | (a_enc << 48), 0};
-                pkt.crc = _mm_crc32_u64(0, pkt.payload); 
-                
-                t2t_radio.broadcast(pkt);
-
-                // 只有隧道未激活，或者发送给不是 3号车 的数据，才走宽带 UDP
-                bool in_tunnel_jamming = tunnel_active && (i == 2);
-                
-                if (!in_tunnel_jamming) {
-                    sendto(send_sd, &pkt, sizeof(pkt), 0, (struct sockaddr*)&group_addr, sizeof(group_addr));
-                }
+            if (link_active) {
+                float env_feedback[3] = {true_gap, true_front_vel, 0.0f};
+                std::this_thread::sleep_for(std::chrono::microseconds(simulated_latency_us));
+                sendto(server_sd, env_feedback, sizeof(env_feedback), 0, (struct sockaddr*)&active_client_addr, sizeof(active_client_addr));
             }
         }
 
-        if (step % 20 == 0) {
-            std::printf("\033[2J\033[H=== SD-VCU HIL & DUAL-LINK MONITOR ===\n");
-            std::printf("Sim Time: %7.2fs | Dynamic Topology Active\n", elapsed);
-            
-            if (collision) std::printf(">>> CRITICAL ALARM: COLLISION DETECTED. FLEET HALTED. <<<\n");
-            
-            if (tunnel_active) {
-                std::printf("\033[41;37m [! EVENT !] TUNNEL JAMMING ACTIVE: V2V UDP NETWORK DISCONNECTED \033[0m\n");
-            }
-
-            std::printf("ID | TruePos(m)| TrueVel(km/h)|  Gap(m) | Safe(m) | Force(kN) | State Machine Mode\n");
-            for (int i = 0; i < 5; ++i) {
-                float gap = (i == 0) ? 0.0f : fleet[i-1].pos - fleet[i].pos;
-                float s_dist = (i == 0) ? 0.0f : PerceptionEngine::calculate_safe_dist(fleet[i].vel, fleet[i-1].vel, TrainType::HEAVY_HAUL);
-                
-                const char* status_str = "\033[32mFOLLOWER\033[0m";
-                if (i == 0) {
-                    status_str = "\033[36mLEADER_A\033[0m";
-                } else if (fleet_status[i] == 1) {
-                    status_str = "\033[31mATP_TRIP\033[0m"; 
-                } else if (fleet_status[i] == 2) {
-                    status_str = "\033[33mDECOUPLING\033[0m"; 
-                } else if (fleet_status[i] == 3) {
-                    status_str = "\033[35mLEADER_B\033[0m"; 
-                }
-
-                std::printf("[%d] |  %7.1f |    %9.1f | %7.1f | %7.1f | %9.1f | %s\n", 
-                            i, fleet[i].pos, fleet[i].vel*3.6, gap, s_dist, fleet[i].cmd_force/1000.0, status_str);
-            }
+        log_file << elapsed_s << ",";
+        for (int i = 0; i < 5; ++i) {
+            log_file << fleet[i].pos << "," << fleet[i].vel * 3.6f << "," << forces[i] / 1000.0f << "," << fleet_status[i] << (i == 4 ? "" : ",");
         }
-        step++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        log_file << "\n";
+        log_file.flush(); 
+
+        std::this_thread::sleep_until(current_time + std::chrono::milliseconds(10));
     }
-    if (mvb_fd >= 0) close(mvb_fd);
     return 0;
 }

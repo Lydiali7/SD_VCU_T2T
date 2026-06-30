@@ -12,7 +12,7 @@ private:
     int uart_fd;
     uint8_t target_channel;
     
-    // 串口流缓冲区，用于处理粘包和断包
+    // Serial stream buffer for handling packet fragmentation and concatenation
     std::vector<uint8_t> rx_stream_buffer;
 
 public:
@@ -22,22 +22,26 @@ public:
         if (uart_fd >= 0) close(uart_fd);
     }
 
+    int get_fd() const {
+        return uart_fd;
+    }
+
     /**
-     * 初始化 E22 LoRa 模块串口
-     * @param dev_node: 驱动生成的节点，如 "/dev/ttyWCH0"
-     * @param channel: 目标通信信道 (需与硬件配置一致)
+     * Initialize E22 LoRa module serial port
+     * @param dev_node: Device node mapped by OS, e.g., "/dev/ttyWCH0"
+     * @param channel: Target frequency channel (must match hardware config)
      */
     bool init(const char* dev_node, int baud_rate = B115200, uint8_t channel = 0x17) {
         target_channel = channel;
         
-        // 1. 以非阻塞读写模式打开串口
+        // 1. Open serial port in non-blocking read/write mode
         uart_fd = open(dev_node, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (uart_fd < 0) {
             perror("[T2T_Radio] Open Serial Failed");
             return false;
         }
 
-        // 2. 配置 termios 硬件参数 (8N1)
+        // 2. Configure termios hardware parameters (8N1)
         struct termios options;
         tcgetattr(uart_fd, &options);
         cfsetispeed(&options, baud_rate);
@@ -46,7 +50,7 @@ public:
         options.c_cflag |= (CLOCAL | CREAD | CS8);
         options.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
         
-        // 设置为 Raw Mode (原始透传)，禁止回显和特殊字符处理
+        // Enable Raw Mode, disabling echo and special character processing
         options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
         options.c_oflag &= ~OPOST;
 
@@ -58,15 +62,15 @@ public:
     }
 
     /**
-     * E22 定点广播发射
-     * 格式: ADDH(FF) + ADDL(FF) + CHAN(target_channel) + DATA
+     * E22 Fixed-point Broadcast Transmission
+     * Format: ADDH(FF) + ADDL(FF) + CHAN(target_channel) + DATA
      */
     bool broadcast(const RawT2TPacket& pkt) {
         if (uart_fd < 0) return false;
 
         uint8_t tx_buf[128];
-        tx_buf[0] = 0xFF; // 广播目标地址高位
-        tx_buf[1] = 0xFF; // 广播目标地址低位
+        tx_buf[0] = 0xFF; // Broadcast target address HIGH
+        tx_buf[1] = 0xFF; // Broadcast target address LOW
         tx_buf[2] = target_channel;
         
         std::memcpy(tx_buf + 3, &pkt, sizeof(RawT2TPacket));
@@ -77,7 +81,7 @@ public:
     }
 
     /**
-     * 基于滑动窗口的串口流数据解析
+     * Serial stream parsing based on a jitter-free sliding window
      */
     bool receive(RawT2TPacket& pkt) {
         if (uart_fd < 0) return false;
@@ -89,22 +93,35 @@ public:
             rx_stream_buffer.insert(rx_stream_buffer.end(), temp_buf, temp_buf + len);
         }
 
-        // 寻找帧头 0x55AA55AA 并对齐
-        while (rx_stream_buffer.size() >= sizeof(RawT2TPacket)) {
-            // 快速扫描帧头
+        // Search for header 0x55AA55AA and align payload
+        // Using sliding cursor to replace O(N) erase, eliminating memory jitter
+        size_t search_idx = 0;
+        bool found = false;
+
+        while (rx_stream_buffer.size() - search_idx >= sizeof(RawT2TPacket)) {
+            // Fast header scanning (Offset by 4 bytes due to sender_id)
             uint32_t header;
-            std::memcpy(&header, rx_stream_buffer.data() + 4, 4); // 偏移4字节看 header 字段
+            std::memcpy(&header, rx_stream_buffer.data() + search_idx + 4, 4);
 
             if (header == 0x55AA55AA) {
-                // 校验通过，提取全包
-                std::memcpy(&pkt, rx_stream_buffer.data(), sizeof(RawT2TPacket));
-                rx_stream_buffer.erase(rx_stream_buffer.begin(), rx_stream_buffer.begin() + sizeof(RawT2TPacket));
-                return true;
+                // Validation passed, extract full packet
+                std::memcpy(&pkt, rx_stream_buffer.data() + search_idx, sizeof(RawT2TPacket));
+                
+                // Batch clear invalid bytes and the current packet from memory
+                rx_stream_buffer.erase(rx_stream_buffer.begin(), rx_stream_buffer.begin() + search_idx + sizeof(RawT2TPacket));
+                found = true;
+                break; // Output only one complete packet per receive call
             } else {
-                // 没对齐，弹出首字节继续寻找
-                rx_stream_buffer.erase(rx_stream_buffer.begin());
+                // Misaligned, advance cursor without moving memory
+                search_idx++;
             }
         }
-        return false;
+
+        // Prevent infinite memory growth by clearing confirmed garbage data
+        if (!found && search_idx > 0) {
+            rx_stream_buffer.erase(rx_stream_buffer.begin(), rx_stream_buffer.begin() + search_idx);
+        }
+
+        return found; 
     }
 };

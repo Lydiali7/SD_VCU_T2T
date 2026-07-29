@@ -1,4 +1,5 @@
 #pragma once
+#include <cerrno>
 #include <iostream>
 #include <cstring>
 #include <unistd.h>
@@ -37,7 +38,9 @@ public:
         // 1. Open serial port in non-blocking read/write mode
         uart_fd = open(dev_node, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (uart_fd < 0) {
-            perror("[T2T_Radio] Open Serial Failed");
+            std::cerr << "[LORA_WARN] " << dev_node << " unavailable ("
+                      << std::strerror(errno)
+                      << "). Safety radio disabled for simulation.\n";
             return false;
         }
 
@@ -68,13 +71,16 @@ public:
     bool broadcast(const RawT2TPacket& pkt) {
         if (uart_fd < 0) return false;
 
-        uint8_t tx_buf[128];
+        TrainBusFrame frame;
+        if (!TrainBusFraming::encode_raw_t2t(frame, pkt)) return false;
+
+        uint8_t tx_buf[256];
         tx_buf[0] = 0xFF; // Broadcast target address HIGH
         tx_buf[1] = 0xFF; // Broadcast target address LOW
         tx_buf[2] = target_channel;
         
-        std::memcpy(tx_buf + 3, &pkt, sizeof(RawT2TPacket));
-        int total_len = 3 + sizeof(RawT2TPacket);
+        std::memcpy(tx_buf + 3, &frame, sizeof(frame));
+        int total_len = 3 + sizeof(frame);
 
         ssize_t sent = write(uart_fd, tx_buf, total_len);
         return sent == total_len;
@@ -98,19 +104,20 @@ public:
         size_t search_idx = 0;
         bool found = false;
 
-        while (rx_stream_buffer.size() - search_idx >= sizeof(RawT2TPacket)) {
-            // Fast header scanning (Offset by 4 bytes due to sender_id)
-            uint32_t header;
-            std::memcpy(&header, rx_stream_buffer.data() + search_idx + 4, 4);
+        while (rx_stream_buffer.size() - search_idx >= sizeof(TrainBusFrame)) {
+            uint16_t sof;
+            std::memcpy(&sof, rx_stream_buffer.data() + search_idx, sizeof(sof));
 
-            if (header == 0x55AA55AA) {
-                // Validation passed, extract full packet
-                std::memcpy(&pkt, rx_stream_buffer.data() + search_idx, sizeof(RawT2TPacket));
+            if (sof == TrainBusFraming::SOF) {
+                TrainBusFrame frame;
+                std::memcpy(&frame, rx_stream_buffer.data() + search_idx, sizeof(frame));
                 
-                // Batch clear invalid bytes and the current packet from memory
-                rx_stream_buffer.erase(rx_stream_buffer.begin(), rx_stream_buffer.begin() + search_idx + sizeof(RawT2TPacket));
-                found = true;
-                break; // Output only one complete packet per receive call
+                if (TrainBusFraming::decode_raw_t2t(frame, pkt)) {
+                    rx_stream_buffer.erase(rx_stream_buffer.begin(), rx_stream_buffer.begin() + search_idx + sizeof(frame));
+                    found = true;
+                    break;
+                }
+                search_idx++;
             } else {
                 // Misaligned, advance cursor without moving memory
                 search_idx++;

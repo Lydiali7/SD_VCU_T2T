@@ -8,6 +8,8 @@
 #include <cstring>
 #include <vector>
 #include <cstdint>
+#include <algorithm>
+#include "perception.hpp"
 
 class MVB_Device {
 private:
@@ -77,6 +79,19 @@ public:
     int read_frame(void* buffer, size_t size) {
         if (!is_initialized) return -1;
         return read(fd, buffer, size);
+    }
+
+    int read_buffer(StandardInputBuffer& input) {
+        if (!is_initialized) return -1;
+        input.source = HalBusSource::MVB_TRAIN_LINE;
+        input.channel = 0;
+        int n = read(fd, input.data, sizeof(input.data));
+        if (n > 0) {
+            input.len = static_cast<size_t>(n);
+            return n;
+        }
+        input.len = 0;
+        return n;
     }
 
     int write_frame(const void* buffer, size_t size) {

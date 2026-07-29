@@ -25,6 +25,7 @@ if ! ip link show vcan0 > /dev/null 2>&1; then
 fi
 
 # 清理旧进程，防止端口冲突
+tmux kill-session -t SDVCU_Sim 2>/dev/null
 pkill -f world_server
 pkill -f vcu_node
 pkill -f socat
@@ -38,22 +39,21 @@ socat -d -d PTY,link=/tmp/lora-server,raw,echo=0 PTY,link=/tmp/lora-node,raw,ech
 # 给系统 1 秒钟时间把线缆插好
 sleep 1 
 
-echo "[SYSTEM] 启动车厢大脑节点 (HIL 模式: 仅测试 3 号车)..."
-./vcu_node 3 > vcu_node_3.log 2>&1 &
-
-
 # TMUX 自动化分屏魔法开始
 
 SESSION_NAME="SDVCU_Sim"
-
-# 杀死已经存在的同名 tmux 会话
-tmux kill-session -t $SESSION_NAME 2>/dev/null
 
 # 创建一个后台运行的新 tmux 会话
 tmux new-session -d -s $SESSION_NAME
 
 # 此时我们有一个大窗口 (编号 0)。让它运行 world_server
-tmux send-keys -t $SESSION_NAME:0 "./world_server" C-m
+tmux send-keys -t $SESSION_NAME:0 "SDVCU_MODE=SIM ./world_server; echo '[SYSTEM] Scenario complete. Closing dashboard in 5 seconds...'; sleep 5; tmux kill-session -t $SESSION_NAME" C-m
+
+sleep 1
+echo "[SYSTEM] 启动车厢大脑节点 (SIM 模式: 仅测试 3 号车)..."
+SDVCU_MODE=SIM LORA_DEV=/tmp/lora-node ./vcu_node 3 > vcu_node_3.log 2>&1 &
+vcu_pid=$!
+echo "$vcu_pid" > vcu_node_3.pid
 
 # 垂直切割屏幕（右边分出一半，编号 1）
 tmux split-window -h -t $SESSION_NAME:0
@@ -65,7 +65,7 @@ tmux send-keys -t $SESSION_NAME:0.1 "candump -c vcan0" C-m
 tmux split-window -v -t $SESSION_NAME:0.1
 
 # 在右下角实时滚动查看 3号车 的底层思考日志
-tmux send-keys -t $SESSION_NAME:0.2 "tail -f vcu_node_3.log" C-m
+tmux send-keys -t $SESSION_NAME:0.2 "tail --pid=$vcu_pid -f vcu_node_3.log; echo '[SYSTEM] vcu_node exited cleanly.'" C-m
 
 # 调整一下左边主窗口的大小 (让 server 表格有足够的空间)
 tmux resize-pane -R -t $SESSION_NAME:0.0 20

@@ -1,0 +1,11 @@
+src/vcu_node.o: src/vcu_node.cpp include/network_proto.hpp \
+ include/perception.hpp include/train_dynamics.hpp include/t2t_radio.hpp \
+ include/infra/rt_system.hpp include/infra/watching_dog.hpp \
+ include/safety_config.hpp
+include/network_proto.hpp:
+include/perception.hpp:
+include/train_dynamics.hpp:
+include/t2t_radio.hpp:
+include/infra/rt_system.hpp:
+include/infra/watching_dog.hpp:
+include/safety_config.hpp:

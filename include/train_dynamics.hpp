@@ -96,9 +96,8 @@ public:
     }
 };
 
-// =================================================================
 // Heterogeneous Platoon Configuration
-// =================================================================
+\
 struct TrainConfig {
     LocoModel model;
     int num_wagons;

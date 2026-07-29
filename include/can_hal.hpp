@@ -14,19 +14,21 @@
 #include <unistd.h>
 #include <algorithm> 
 #include "network_proto.hpp" 
+#include "perception.hpp"
 
 // 抽象基类，定义统一的 CAN 接口
 class ICanDevice {
 public:
     virtual bool init() = 0;
+    virtual int receive(StandardInputBuffer& input) = 0;
     virtual int receive(CANPacket& pkt) = 0;
     virtual int send(const CANPacket& pkt) = 0;
     virtual ~ICanDevice() = default;
 };
 
-// =================================================================
+
 // 1. SocketCAN 实现 (用于纯软件仿真, 如 vcan0)
-// =================================================================
+
 class SocketCanDevice : public ICanDevice {
 private:
     int sd;
@@ -57,10 +59,23 @@ public:
         return true;
     }
 
-    int receive(CANPacket& pkt) override {
+    int receive(StandardInputBuffer& input) override {
         struct canfd_frame frame;
         if (read(sd, &frame, sizeof(frame)) > 0) {
-            std::memcpy(&pkt, frame.data, sizeof(CANPacket));
+            input.source = HalBusSource::CAN_RADAR;
+            input.channel = static_cast<uint16_t>(frame.can_id);
+            input.len = std::min<size_t>(frame.len, sizeof(input.data));
+            std::memcpy(input.data, frame.data, input.len);
+            return 1;
+        }
+        return 0;
+    }
+
+    int receive(CANPacket& pkt) override {
+        StandardInputBuffer input;
+        int ret = receive(input);
+        if (ret > 0 && input.len >= sizeof(CANPacket)) {
+            std::memcpy(&pkt, input.data, sizeof(CANPacket));
             return 1;
         }
         return 0;
@@ -81,9 +96,8 @@ public:
     }
 };
 
-// =================================================================
 // 2. 广成 USBCAN 实现 (动态加载 libcontrolcan.so)
-// =================================================================
+
 class UsbCanDevice : public ICanDevice {
 private:
     // CANalyst-II 厂家标准结构体 (对照 controlcan.h)
@@ -151,12 +165,25 @@ public:
         return true;
     }
 
-    int receive(CANPacket& pkt) override {
+    int receive(StandardInputBuffer& input) override {
         VCI_CAN_OBJ vci_obj;
         if (vci_receive && vci_receive(4, 0, 0, &vci_obj, 1, 0) > 0) {
-            std::memcpy(&pkt, vci_obj.Data, std::min(sizeof(CANPacket), (size_t)vci_obj.DataLen));
-            // 【修正】：将收到的硬件 ID 赋值给应用层的 source_id
-            pkt.source_id = vci_obj.ID; 
+            input.source = HalBusSource::CAN_RADAR;
+            input.channel = static_cast<uint16_t>(vci_obj.ID);
+            input.len = std::min<size_t>(vci_obj.DataLen, sizeof(input.data));
+            std::memcpy(input.data, vci_obj.Data, input.len);
+            return 1;
+        }
+        return 0;
+    }
+
+    int receive(CANPacket& pkt) override {
+        StandardInputBuffer input;
+        int ret = receive(input);
+        if (ret > 0) {
+            std::memset(&pkt, 0, sizeof(pkt));
+            pkt.source_id = input.channel;
+            std::memcpy(pkt.payload, input.data, std::min(input.len, sizeof(pkt.payload)));
             return 1;
         }
         return 0;
@@ -166,7 +193,6 @@ public:
         VCI_CAN_OBJ vci_obj;
         memset(&vci_obj, 0, sizeof(VCI_CAN_OBJ));
         
-        // 【修正】：完全对齐 network_proto.hpp 中的 source_id
         vci_obj.ID = pkt.source_id; 
         vci_obj.SendType = 0;       
         vci_obj.RemoteFlag = 0;     

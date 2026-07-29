@@ -2,15 +2,15 @@
 #include <immintrin.h>
 #include <nmmintrin.h>
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include <algorithm>
 #include <cstring>
 #include "network_proto.hpp"
 #include "train_dynamics.hpp"
 
-// =========================================================
+
 // 1. Legacy & Compatibility Definitions 
-// =========================================================
 enum class TrainType {
     DF4D,
     DF8B,
@@ -29,16 +29,31 @@ struct TrainState {
     uint16_t lora_target_addr = 0xFFFF;
 };
 
-// =========================================================
+
 // 2. Hardware Accelerated Perception Structures
-// =========================================================
+
 struct alignas(64) SensorData {
     float distances[16]; 
 };
 
-// =========================================================
+enum class HalBusSource : uint8_t {
+    UNKNOWN = 0,
+    CAN_RADAR = 1,
+    MVB_TRAIN_LINE = 2,
+    T2T_RADIO = 3
+};
+
+struct StandardInputBuffer {
+    HalBusSource source = HalBusSource::UNKNOWN;
+    uint16_t channel = 0;
+    uint64_t timestamp_us = 0;
+    size_t len = 0;
+    uint8_t data[256] = {0};
+};
+
+
 // 3. Kalman Filter for Tunnel Blind Run
-// =========================================================
+
 class KalmanTracker {
 public:
     float pos;
@@ -66,9 +81,9 @@ public:
     }
 };
 
-// =========================================================
+
 // 4. Core Logic & Math Engines
-// =========================================================
+
 class SDVCU_Core {
 private:
     int consecutive_errors;
@@ -80,7 +95,7 @@ private:
     LocoModel front_loco_model;
     int num_wagons;
 
-    bool avx2_payload_match(const SensorData& a, const SensorData& b);
+    bool avx2_payload_match(const SensorData& a, const SensorData& b); //to be implemented with prototype for fast comparison
 
 public:
     float current_safe_gap;
@@ -98,8 +113,11 @@ public:
 class PerceptionEngine {
 public:
     static bool fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t& last_seq);
+    static bool decode_input_buffer(const StandardInputBuffer& input, SensorData& out);
+    static bool decode_can_radar_buffer(const StandardInputBuffer& input, SensorData& out);
+    static bool decode_mvb_trainline_buffer(const StandardInputBuffer& input, SensorData& out);
     
-    // [MODIFIED] Added current_gradient_permille for topography awareness
+    //Added current_gradient_permille for topography awareness
     static float calculate_heavy_haul_safe_dist(
         float v_rear_mps, float v_front_mps, 
         LocoModel rear_model, LocoModel front_model, 

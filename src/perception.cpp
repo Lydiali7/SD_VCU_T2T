@@ -1,6 +1,13 @@
 #include "perception.hpp"
 #include <iostream>
 #include <algorithm>
+#include <random>
+#include <cmath>
+
+//Static Random Number Generators for Fading Models
+static std::random_device rd;
+static std::mt19937 rf_gen(rd());
+static std::normal_distribution<float> gauss_dist(0.0f, 1.0f);
 
 bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uint32_t& last_seq) {
     if (raw.header != 0x55AA55AA || raw.seq <= last_seq) return false;
@@ -14,6 +21,65 @@ bool PerceptionEngine::fast_unpack(const RawT2TPacket& raw, SensorData& out, uin
     out.distances[0] = p_raw / 100.0f; 
     out.distances[1] = v_raw / 100.0f; 
     out.distances[2] = a_raw / 100.0f; 
+    return true;
+}
+
+bool PerceptionEngine::decode_input_buffer(const StandardInputBuffer& input, SensorData& out) {
+    switch (input.source) {
+        case HalBusSource::CAN_RADAR:
+            return decode_can_radar_buffer(input, out);
+        case HalBusSource::MVB_TRAIN_LINE:
+            return decode_mvb_trainline_buffer(input, out);
+        case HalBusSource::T2T_RADIO: {
+            if (input.len < sizeof(TrainBusFrame)) return false;
+            TrainBusFrame frame;
+            std::memcpy(&frame, input.data, sizeof(frame));
+            RawT2TPacket pkt;
+            uint32_t seq = 0;
+            return TrainBusFraming::decode_raw_t2t(frame, pkt) && fast_unpack(pkt, out, seq);
+        }
+        default:
+            return false;
+    }
+}
+
+bool PerceptionEngine::decode_can_radar_buffer(const StandardInputBuffer& input, SensorData& out) {
+    std::memset(&out, 0, sizeof(out));
+
+    if (input.len >= sizeof(CANPacket)) {
+        CANPacket pkt;
+        std::memcpy(&pkt, input.data, sizeof(pkt));
+        if (pkt.header == 0x55AA55AA) {
+            size_t count = std::min<size_t>(10, sizeof(out.distances) / sizeof(out.distances[0]));
+            std::memcpy(out.distances, pkt.payload, count * sizeof(float));
+            return true;
+        }
+    }
+
+    // Compact radar fallback: distance, ego velocity, front velocity as float32.
+    if (input.len >= 3 * sizeof(float)) {
+        std::memcpy(out.distances, input.data, 3 * sizeof(float));
+        return true;
+    }
+
+    return false;
+}
+
+bool PerceptionEngine::decode_mvb_trainline_buffer(const StandardInputBuffer& input, SensorData& out) {
+    std::memset(&out, 0, sizeof(out));
+    if (input.len < sizeof(MVB_Hardware_Frame)) return false;
+
+    MVB_Hardware_Frame frame;
+    std::memcpy(&frame, input.data, sizeof(frame));
+    if (!ProtocolConverter::validate_mvb(reinterpret_cast<const uint8_t*>(&frame), sizeof(frame))) {
+        return false;
+    }
+
+    out.distances[0] = 0.0f;                         // No radar gap in MVB train-line frame
+    out.distances[1] = frame.raw_speed / 100.0f;     // ego speed
+    out.distances[2] = -1.0f;                        // front speed unavailable
+    out.distances[3] = frame.brake_press / 10.0f;    // brake pipe/cylinder pressure
+    out.distances[4] = static_cast<float>(frame.io_status);
     return true;
 }
 
@@ -39,7 +105,7 @@ float PerceptionEngine::calculate_heavy_haul_safe_dist(
     // Front train braking distance integration
     while (temp_v_front > 0.0f) {
         float inst_decel = HeavyHaulDynamics::get_instant_deceleration(temp_v_front, front_wagon, front_num, front_loco);
-        inst_decel += g_component; // Apply gradient effect
+        inst_decel += g_component; 
         if (inst_decel < 0.05f) inst_decel = 0.05f; 
         
         temp_v_front -= inst_decel * dt;
@@ -59,7 +125,7 @@ float PerceptionEngine::calculate_heavy_haul_safe_dist(
     // Rear train braking distance integration
     while (temp_v_rear > 0.0f) {
         float inst_decel = HeavyHaulDynamics::get_instant_deceleration(temp_v_rear, rear_wagon, rear_num, rear_loco);
-        inst_decel += g_component; // Apply gradient effect
+        inst_decel += g_component; 
         if (inst_decel < 0.05f) inst_decel = 0.05f;
 
         temp_v_rear -= inst_decel * dt;
@@ -72,23 +138,41 @@ float PerceptionEngine::calculate_heavy_haul_safe_dist(
 }
 
 float PerceptionEngine::get_packet_error_rate(float distance_m, bool is_in_tunnel) {
-    // 1. 链路预算参数
-    const float P_tx_dbm = 23.0f;       // 发射功率 (dBm)
-    const float Noise_floor_dbm = -110.0f; // 背景噪声 (dBm)
-    const float Reference_path_loss = 40.0f; // 1米处的路径损耗 (dB)
-    const float Path_loss_exponent = 2.0f;  // 铁路环境路径损耗指数
-    const float Tunnel_occlusion_db = 25.0f; // 隧道遮挡损耗 (dB)
+    const float P_tx_dbm = 23.0f;           
+    const float Noise_floor_dbm = -110.0f;  
+    const float Reference_path_loss = 40.0f; 
+    const float Path_loss_exponent = 2.4f;   
+    const float Tunnel_occlusion_db = 25.0f; 
 
-    // 2. 计算路径损耗
+    // 1. Large-scale Fading (Path Loss)
     float path_loss = Reference_path_loss + 10.0f * Path_loss_exponent * std::log10(std::max(distance_m, 1.0f));
     if (is_in_tunnel) path_loss += Tunnel_occlusion_db;
 
-    // 3. 计算 SNR
-    float snr = P_tx_dbm - path_loss - Noise_floor_dbm;
+    // 2. Small-scale Fast Fading (Multipath)
+    float fading_db = 0.0f;
+    if (is_in_tunnel) {
+        // NLOS (Tunnel): Rayleigh Fading
+        float x = gauss_dist(rf_gen);
+        float y = gauss_dist(rf_gen);
+        float rayleigh_linear = (x * x + y * y) / 2.0f; 
+        fading_db = 10.0f * std::log10(std::max(rayleigh_linear, 0.0001f)); 
+    } else {
+        // LOS (Open Area): Rician Fading (K-factor = 4.0 ~ 6dB)
+        float K_linear = 4.0f; 
+        float mean = std::sqrt(K_linear / (K_linear + 1.0f));
+        float sigma = std::sqrt(1.0f / (2.0f * (K_linear + 1.0f)));
+        
+        float x = mean + sigma * gauss_dist(rf_gen);
+        float y = sigma * gauss_dist(rf_gen);
+        float rician_linear = (x * x + y * y);
+        fading_db = 10.0f * std::log10(std::max(rician_linear, 0.0001f));
+    }
 
-    // 4. 将 SNR 映射到 PER (采用 Sigmoid 函数模拟瀑布效应)
-    // 阈值设为 10dB，低于 10dB 时 PER 迅速飙升至 100%
-    float k = 0.8f; // 曲线陡峭度
+    // 3. Final SNR calculation with Multipath Perturbation
+    float snr = P_tx_dbm - path_loss + fading_db - Noise_floor_dbm;
+
+    // 4. Map SNR to PER
+    float k = 0.8f; 
     float threshold = 10.0f; 
     float per = 1.0f / (1.0f + std::exp(k * (snr - threshold)));
 
@@ -133,7 +217,6 @@ bool SDVCU_Core::process_sensors(uint16_t seq_num, const SensorData& path_a, con
         WagonProfile my_wagon = my_cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
         WagonProfile front_wagon = front_cfg.is_empty ? HeavyHaulDynamics::C80_EMPTY_PROFILE : HeavyHaulDynamics::C80_PROFILE;
 
-        // Default to 0.0f gradient for hardware radar fallback during process_sensors
         current_safe_gap = PerceptionEngine::calculate_heavy_haul_safe_dist(
             current_vel, front_vel, my_cfg.model, front_cfg.model, 
             my_wagon, front_wagon, my_cfg.num_wagons, front_cfg.num_wagons, false, current_aoi_s, 0.0f);
@@ -151,5 +234,6 @@ bool SDVCU_Core::process_sensors(uint16_t seq_num, const SensorData& path_a, con
     
     return !is_eb_triggered;
 }
+
 bool SDVCU_Core::is_eb() const { return is_eb_triggered; }
 void SDVCU_Core::force_eb_trigger() { is_eb_triggered = true; }

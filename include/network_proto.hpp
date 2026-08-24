@@ -303,6 +303,24 @@ inline bool build_t2t_atp_snapshot_frame(uint32_t source_train_id, uint32_t dest
     return true;
 }
 
+inline bool validate_t2t_atp_snapshot_frame(const T2TAtpSnapshotFrame& frame) {
+    if (frame.header.magic != T2T_FRAME_MAGIC) return false;
+    if (frame.header.version != T2T_FRAME_VERSION) return false;
+    if (frame.header.msg_type != static_cast<uint8_t>(T2TMsgType::ATP_SNAPSHOT)) return false;
+    if (frame.header.header_len != sizeof(T2TFrameHeader)) return false;
+    if (frame.header.payload_len != sizeof(T2TAtpSnapshotPayload)) return false;
+
+    AtpSnapshot snapshot = frame.payload.snapshot;
+    uint32_t expected_snapshot_crc = snapshot.crc32;
+    finalize_atp_snapshot_crc(snapshot);
+    if (snapshot.crc32 != expected_snapshot_crc) return false;
+
+    uint32_t expected_frame_crc = t2t_crc32_fnv1a(
+        reinterpret_cast<const uint8_t*>(&frame),
+        offsetof(T2TAtpSnapshotFrame, frame_crc32));
+    return expected_frame_crc == frame.frame_crc32;
+}
+
 enum class TrainBusType : uint8_t {
     T2T_RADIO = 1,
     MVB = 2,

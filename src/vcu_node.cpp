@@ -12,6 +12,7 @@
 #include <fstream> 
 #include <ctime>
 #include <string>
+#include "atp_adapter.hpp"
 #include "network_proto.hpp"
 #include "perception.hpp"
 #include "t2t_radio.hpp" 
@@ -71,6 +72,131 @@ float get_env_float(const char* name, float default_value) {
 int get_env_int(const char* name, int default_value) {
     const char* value = std::getenv(name);
     return value ? std::atoi(value) : default_value;
+}
+
+struct PeerHealthState {
+    bool enabled = false;
+    bool has_valid = false;
+    int sd = -1;
+    uint16_t listen_port = static_cast<uint16_t>(VCU_PEER_PORT + 1);
+    uint32_t expected_sender_id = T2T_BROADCAST_TRAIN_ID;
+    uint32_t last_seq = 0;
+    uint32_t received_count = 0;
+    uint32_t seq_gap_count = 0;
+    uint32_t invalid_count = 0;
+    uint32_t wrong_source_count = 0;
+    ssize_t last_invalid_size = 0;
+    uint32_t last_invalid_header = 0;
+    uint64_t last_rx_us = 0;
+    PeerHealthPacket latest = {};
+    char last_src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t last_src_port = 0;
+};
+
+bool init_peer_health_receiver(PeerHealthState& state) {
+    if (get_env_int("VCU_PEER_HEALTH_RX", 1) == 0) {
+        std::cout << "[PEER_HEALTH_RX] Disabled by VCU_PEER_HEALTH_RX=0\n";
+        return false;
+    }
+
+    int listen_port = get_env_int("VCU_PEER_HEALTH_PORT", VCU_PEER_PORT + 1);
+    if (listen_port <= 0 || listen_port > 65535) {
+        std::cerr << "[PEER_HEALTH_RX] Invalid VCU_PEER_HEALTH_PORT: " << listen_port << "\n";
+        return false;
+    }
+    state.listen_port = static_cast<uint16_t>(listen_port);
+
+    int expected_peer = get_env_int("VCU_EXPECTED_PEER_ID", -1);
+    state.expected_sender_id = (expected_peer >= 0)
+                                   ? static_cast<uint32_t>(expected_peer)
+                                   : T2T_BROADCAST_TRAIN_ID;
+
+    state.sd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state.sd < 0) {
+        std::perror("[PEER_HEALTH_RX] socket");
+        return false;
+    }
+
+    int reuse_addr = 1;
+    setsockopt(state.sd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+
+    sockaddr_in bind_addr = {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(state.listen_port);
+    const char* bind_ip = std::getenv("VCU_PEER_BIND_IP");
+    if (bind_ip == nullptr || bind_ip[0] == '\0') {
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, bind_ip, &bind_addr.sin_addr) != 1) {
+        std::cerr << "[PEER_HEALTH_RX] Invalid VCU_PEER_BIND_IP: " << bind_ip << "\n";
+        close(state.sd);
+        state.sd = -1;
+        return false;
+    }
+
+    if (bind(state.sd, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+        std::perror("[PEER_HEALTH_RX] bind");
+        close(state.sd);
+        state.sd = -1;
+        return false;
+    }
+
+    state.enabled = true;
+    std::cout << "[PEER_HEALTH_RX] Listening on UDP port " << state.listen_port;
+    if (state.expected_sender_id != T2T_BROADCAST_TRAIN_ID) {
+        std::cout << " expected_peer=" << state.expected_sender_id;
+    }
+    std::cout << "\n";
+    return true;
+}
+
+void poll_peer_health(PeerHealthState& state, RuntimeMode runtime_mode) {
+    if (!state.enabled || state.sd < 0) return;
+
+    while (true) {
+        PeerHealthPacket pkt = {};
+        sockaddr_in src_addr = {};
+        socklen_t src_len = sizeof(src_addr);
+        ssize_t n = recvfrom(state.sd, &pkt, sizeof(pkt), MSG_DONTWAIT,
+                             reinterpret_cast<sockaddr*>(&src_addr), &src_len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            std::perror("[PEER_HEALTH_RX] recvfrom");
+            return;
+        }
+
+        if (n != static_cast<ssize_t>(sizeof(pkt)) || pkt.header != PEER_HEALTH_HEADER) {
+            state.invalid_count++;
+            state.last_invalid_size = n;
+            state.last_invalid_header = pkt.header;
+            continue;
+        }
+        if (state.expected_sender_id != T2T_BROADCAST_TRAIN_ID &&
+            pkt.sender_id != state.expected_sender_id) {
+            state.wrong_source_count++;
+            continue;
+        }
+
+        if (state.has_valid) {
+            uint32_t expected_next = state.last_seq + 1u;
+            if (pkt.seq != expected_next) {
+                state.seq_gap_count++;
+            }
+        }
+
+        state.has_valid = true;
+        state.latest = pkt;
+        state.last_seq = pkt.seq;
+        state.last_rx_us = get_runtime_time_us(runtime_mode);
+        state.received_count++;
+        inet_ntop(AF_INET, &src_addr.sin_addr, state.last_src_ip, sizeof(state.last_src_ip));
+        state.last_src_port = ntohs(src_addr.sin_port);
+    }
+}
+
+float peer_health_rx_aoi_ms(const PeerHealthState& state, RuntimeMode runtime_mode) {
+    if (!state.has_valid) return 999999.0f;
+    uint64_t now_us = get_runtime_time_us(runtime_mode);
+    return (now_us >= state.last_rx_us) ? static_cast<float>(now_us - state.last_rx_us) / 1000.0f : 0.0f;
 }
 
 // 包含了死区与弹性系数的控制器
@@ -186,6 +312,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    PeerHealthState peer_health;
+    init_peer_health_receiver(peer_health);
+
     T2T_Radio lora_radio;
     const char* lora_dev = std::getenv("LORA_DEV");
     if (lora_dev == nullptr) {
@@ -201,7 +330,10 @@ int main(int argc, char* argv[]) {
     std::ofstream vcu_log("vcu_telemetry.csv", std::ios::trunc);
     vcu_log << "Time(s),AoI(ms),BurstLossCount,TimeJitter(us),EstimatedGap(m),SafeGap(m),State,"
             << "EffectiveDelay(s),UncertaintyBuffer(m),SafetyMargin(m),InTunnel,NlosCurve,"
-            << "PlannedBlind,BlindDistance(m),BlindRiskLevel\n";
+            << "PlannedBlind,BlindDistance(m),BlindRiskLevel,"
+            << "PeerHealthValid,PeerHealthRxAoI(ms),PeerReportedAoI(ms),PeerHealthNetwork,"
+            << "PeerHealthSeq,PeerHealthRxCount,PeerHealthSeqGapCount,PeerHealthInvalidCount,"
+            << "PeerHealthWrongSourceCount,PeerHealthLastInvalidSize,PeerHealthLastInvalidHeader\n";
 
     float TARGET_CRUISE_VEL = 24.5f; // 目标巡航速度88
 
@@ -244,6 +376,7 @@ int main(int argc, char* argv[]) {
         kf.predict(dt);
         time_since_last_tx += dt;
         total_ticks++;
+        poll_peer_health(peer_health, runtime_mode);
 
         
         //1.SAFETY PLANE (LoRa Asynchronous EB Polling)
@@ -497,9 +630,7 @@ int main(int argc, char* argv[]) {
         else if (current_state == PlatoonState::DECOUPLING) report_status = STATUS_DECOUPLING;
         else if (current_state == PlatoonState::LEADER_NEW) report_status = STATUS_LEADER_NEW;
 
-        TrainDataSource snapshot_source = hil_mode ? TrainDataSource::HIL_FALLBACK
-                                                   : TrainDataSource::SIM_FALLBACK;
-        build_snapshot_from_sim(
+        FallbackTrainState fallback_state = {
             static_cast<uint32_t>(id),
             get_runtime_time_us(runtime_mode),
             simulated_my_pos,
@@ -507,18 +638,29 @@ int main(int argc, char* argv[]) {
             local_accel_mps2,
             report_status,
             snapshot_seq++,
-            snapshot_source,
-            local_snapshot);
+            hil_mode ? ATPAdapterSource::HIL_FALLBACK : ATPAdapterSource::SIM_FALLBACK
+        };
+        ATPAdapter::from_fallback(fallback_state, local_snapshot);
 
         
         // 7. 遥测与日志输出
         if (tick_counter % 10 == 0 || simulation_complete) {
             float time_s = total_ticks * dt; 
+            float peer_health_rx_aoi = peer_health_rx_aoi_ms(peer_health, runtime_mode);
+            float peer_reported_aoi = peer_health.has_valid ? peer_health.latest.peer_aoi_ms : 999999.0f;
+            uint32_t peer_network_health = peer_health.has_valid ? peer_health.latest.network_health : STATUS_DEGRADED_UU;
+            uint32_t peer_health_seq = peer_health.has_valid ? peer_health.latest.seq : 0u;
             vcu_log << time_s << "," << current_aoi_ms << "," << burst_loss_count << ","
                     << last_time_diff_us << "," << estimated_gap << "," << sdvcu.current_safe_gap << ","
                     << report_status << "," << effective_delay_s << "," << uncertainty_buffer << ","
                     << safety_margin << "," << (in_tunnel ? 1 : 0) << "," << (nlos_curve ? 1 : 0) << ","
-                    << (planned_blind_run ? 1 : 0) << "," << blind_distance_m << "," << blind_risk_level << "\n";
+                    << (planned_blind_run ? 1 : 0) << "," << blind_distance_m << "," << blind_risk_level << ","
+                    << (peer_health.has_valid ? 1 : 0) << "," << peer_health_rx_aoi << ","
+                    << peer_reported_aoi << "," << peer_network_health << ","
+                    << peer_health_seq << "," << peer_health.received_count << ","
+                    << peer_health.seq_gap_count << "," << peer_health.invalid_count << ","
+                    << peer_health.wrong_source_count << "," << peer_health.last_invalid_size << ","
+                    << peer_health.last_invalid_header << "\n";
             // warning:real sys移除flush，转为异步队列写入
             vcu_log.flush(); 
         }
@@ -571,6 +713,21 @@ int main(int argc, char* argv[]) {
         if (++tick_counter >= 100) {
             std::printf("[TELEMETRY] ID:%d | Vel: %5.1f | Gap: %6.1f | AoI: %6.1fms | Uncert: %5.1fm | State: %d\n", 
                 id, simulated_my_vel * 3.6f, estimated_gap, current_aoi_ms, uncertainty_buffer, report_status);
+            if (peer_health.enabled) {
+                std::printf("[PEER_HEALTH_RX] Valid:%d | Peer:%u | Src:%s:%u | RxAoI:%6.1fms | PeerAoI:%6.1fms | Net:%u | Seq:%u | Rx:%u | Gap:%u | Invalid:%u | WrongSrc:%u\n",
+                    peer_health.has_valid ? 1 : 0,
+                    peer_health.has_valid ? peer_health.latest.sender_id : 0u,
+                    peer_health.has_valid ? peer_health.last_src_ip : "-",
+                    peer_health.has_valid ? peer_health.last_src_port : 0u,
+                    peer_health_rx_aoi_ms(peer_health, runtime_mode),
+                    peer_health.has_valid ? peer_health.latest.peer_aoi_ms : 999999.0f,
+                    peer_health.has_valid ? peer_health.latest.network_health : STATUS_DEGRADED_UU,
+                    peer_health.has_valid ? peer_health.latest.seq : 0u,
+                    peer_health.received_count,
+                    peer_health.seq_gap_count,
+                    peer_health.invalid_count,
+                    peer_health.wrong_source_count);
+            }
             tick_counter = 0;
         }
 
@@ -581,5 +738,8 @@ int main(int argc, char* argv[]) {
 
         std::this_thread::sleep_until(loop_start + std::chrono::milliseconds(10));
     }
+    if (peer_health.sd >= 0) close(peer_health.sd);
+    if (t2t_snapshot_sd >= 0) close(t2t_snapshot_sd);
+    if (srv_sd >= 0) close(srv_sd);
     return 0;
 }

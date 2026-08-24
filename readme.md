@@ -70,8 +70,10 @@ It is not yet a certified ATP/TCMS integration. Real ATP/TCMS/MVB/CAN field mapp
 | `include/mvb_hal.hpp` | MVB serial device setup and frame read/write |
 | `include/t2t_radio.hpp` | LoRa/E22 serial radio wrapper |
 | `include/safety_config.hpp` | Safety thresholds and control constants |
+| `tools/t2t_snapshot_dump.cpp` | Passive T2T snapshot receiver and protocol validator |
+| `tools/mock_peer.cpp` | Mock peer OBU: receives snapshots, tracks AoI, optionally sends peer health |
 | `run_tmux.sh` | SIM-mode tmux dashboard launcher |
-| `Makefile` | Builds `world_server` and `vcu_node` |
+| `Makefile` | Builds runtime binaries and protocol test tools |
 | `fleet_log.csv` | World-server fleet log output |
 | `vcu_telemetry.csv` | VCU telemetry output |
 
@@ -394,6 +396,108 @@ report_status
 
 The protocol is ready for future ATP/TCMS/MVB/CAN mapping, but real ATP decoding must wait for the authorized ICD.
 
+### Passive Snapshot Dump
+
+On the receiving host:
+
+```bash
+./t2t_snapshot_dump 9100 3
+```
+
+Arguments:
+
+```text
+9100  listen port
+3     expected source train id
+```
+
+This validates the T2T frame, checks CRC, records the latest peer snapshot, and prints peer AoI and sequence-gap statistics.
+
+### Mock Peer OBU
+
+`mock_peer` is the first step toward a bidirectional T2T HIL loop. It behaves like a simple peer OBU:
+
+```text
+receive T2TAtpSnapshotFrame
+validate header and CRC
+store latest peer state
+track peer AoI and sequence gaps
+optionally inject receiver-side delay/drop
+optionally send PeerHealthPacket periodically
+```
+
+Start a mock peer receiver:
+
+```bash
+./mock_peer 9100 3
+```
+
+Enable receiver-side degradation inside the mock peer:
+
+```bash
+MOCK_PEER_RX_DROP_PROB=0.2 \
+MOCK_PEER_RX_DELAY_BASE_MS=30 \
+MOCK_PEER_RX_DELAY_JITTER_MS=20 \
+./mock_peer 9100 3
+```
+
+Send periodic `PeerHealthPacket` back to a VCU host:
+
+```bash
+MOCK_PEER_HEALTH_IP=10.42.0.33 \
+MOCK_PEER_HEALTH_PORT=9101 \
+./mock_peer 9100 3
+```
+
+If `MOCK_PEER_HEALTH_IP` is not set, `mock_peer` can automatically use the source IP of the latest received snapshot:
+
+```bash
+MOCK_PEER_HEALTH_AUTO_TARGET=1 \
+MOCK_PEER_HEALTH_PORT=9101 \
+./mock_peer 9100 3
+```
+
+The mock output prints the actual health target and byte count:
+
+```text
+[PEER_HEALTH] seq=... target=10.42.0.33:9101 bytes=48 ...
+```
+
+`vcu_node` now has a non-blocking `PeerHealthPacket` receiver. It observes peer health and writes it to `vcu_telemetry.csv`; it does not yet change braking or safety state.
+
+On the VCU side:
+
+```bash
+SDVCU_MODE=HIL SERVER_IP=10.42.0.1 \
+T2T_SNAPSHOT_IP=10.42.0.1 T2T_SNAPSHOT_PORT=9100 \
+VCU_PEER_HEALTH_PORT=9101 \
+./vcu_node 3 --hil
+```
+
+With this setup:
+
+```text
+vcu_node sends AtpSnapshot to mock_peer on 9100
+mock_peer sends PeerHealthPacket back to vcu_node on 9101
+vcu_node logs PeerHealthValid, PeerHealthRxAoI, PeerReportedAoI, source IP, received count, and peer seq-gap counters
+```
+
+Troubleshooting:
+
+```text
+mock_peer rx_count increasing, but vcu_node PeerHealthValid=0 and Invalid=0
+    -> PC is not delivering PeerHealthPacket to vcu_node's UDP socket.
+
+mock_peer [PEER_HEALTH] target points to PC IP instead of VCU IP
+    -> set MOCK_PEER_HEALTH_IP to the VCU host IP, or use auto target.
+
+mock_peer [PEER_HEALTH] bytes=44, but vcu_node Rx count stays 0
+    -> check VCU_PEER_HEALTH_PORT, VCU_PEER_BIND_IP, firewall, and whether the sample runs on the expected network interface.
+
+vcu_node Invalid increases
+    -> the port is receiving a packet, but it is not PeerHealthPacket size/header.
+```
+
 ---
 
 ## Environment Variables
@@ -427,6 +531,26 @@ The protocol is ready for future ATP/TCMS/MVB/CAN mapping, but real ATP decoding
 | `VCU_HIL_DEGRADED_AOI_MS` | `30` | HIL latency threshold for degraded status |
 | `T2T_SNAPSHOT_IP` | unset | Enables optional normalized T2T snapshot output |
 | `T2T_SNAPSHOT_PORT` | `9100` | UDP target port for snapshot output |
+| `VCU_PEER_HEALTH_RX` | `1` | Enable `PeerHealthPacket` receiver |
+| `VCU_PEER_BIND_IP` | `0.0.0.0` | Local bind IP for peer health receiver |
+| `VCU_PEER_HEALTH_PORT` | `9101` | Local UDP port for `PeerHealthPacket` |
+| `VCU_EXPECTED_PEER_ID` | unset | Expected mock peer sender id; unset means accept any |
+
+### Mock Peer
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `MOCK_PEER_LISTEN_PORT` | `9100` | UDP port for incoming `T2TAtpSnapshotFrame` |
+| `MOCK_PEER_EXPECTED_SOURCE_ID` | unset | Expected source train id; unset means accept any |
+| `MOCK_PEER_ID` | `2` | Sender id used in `PeerHealthPacket` |
+| `MOCK_PEER_HEALTH_IP` | unset | Enables health packet output when set |
+| `MOCK_PEER_HEALTH_AUTO_TARGET` | `1` | Auto-reply to the latest snapshot source IP when explicit health IP is unset |
+| `MOCK_PEER_HEALTH_PORT` | `9101` | UDP target port for peer health output |
+| `MOCK_PEER_HEALTH_PERIOD_MS` | `1000` | Peer health transmit period |
+| `MOCK_PEER_FRESH_TIMEOUT_MS` | `1000` | AoI freshness threshold used by mock health |
+| `MOCK_PEER_RX_DROP_PROB` | `0` | Mock receiver-side packet drop probability |
+| `MOCK_PEER_RX_DELAY_BASE_MS` | `0` | Mock receiver-side base delay |
+| `MOCK_PEER_RX_DELAY_JITTER_MS` | `0` | Mock receiver-side random delay range |
 
 ---
 
@@ -494,17 +618,21 @@ tunnel / NLOS / blind-run indicators
 
 Recommended next steps:
 
-1. Obtain ATP/TCMS/MVB/CAN ICDs for the real train interface.
-2. Add `build_snapshot_from_atp_gateway(...)`.
-3. Make `vcu_node` choose data source by mode:
+1. Validate bidirectional T2T HIL:
+   `vcu_node -> AtpSnapshot -> mock_peer -> PeerHealthPacket -> vcu_node`.
+2. Feed peer AoI and peer health into the safety supervisor.
+3. Drive `DEGRADED_UU`, `BLIND_RUN`, and `FAIL_SAFE_LOCK` from measured peer communication health.
+4. Extend mock-peer tests to cover clean link, degraded link, blind-run recovery, and fail-safe lock.
+5. Obtain ATP/TCMS/MVB/CAN ICDs for the real train interface.
+6. Add `build_snapshot_from_atp_gateway(...)`.
+7. Make `vcu_node` choose data source by mode:
    - SIM fallback
    - HIL fallback
    - MVB/CAN gateway
    - ATP/TCMS gateway
-4. Add a receiver/parser for `T2TAtpSnapshotFrame`.
-5. Cross-check peer-reported safety state against local safety envelope.
-6. Replace raw UDP research transport with authenticated, replay-protected safety communication.
-7. Move CSV logging to an async logger for real-time operation.
+8. Cross-check peer-reported safety state against local safety envelope.
+9. Replace raw UDP research transport with authenticated, replay-protected safety communication.
+10. Move CSV logging to an async logger for real-time operation.
 
 ---
 
@@ -523,4 +651,3 @@ future ATP/TCMS/MVB/CAN authorized data integration
 ```
 
 The current `AtpSnapshot` design should be treated as a normalized interface contract. Its field mapping must be finalized against real train-network ICDs before claiming real ATP integration.
-

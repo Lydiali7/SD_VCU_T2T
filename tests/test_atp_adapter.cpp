@@ -63,6 +63,10 @@ int main() {
     T2TAtpSnapshotFrame corrupted_frame = frame;
     corrupted_frame.payload.snapshot.train_pos_cm += 1;
     ok &= expect_true(!validate_t2t_atp_snapshot_frame(corrupted_frame), "T2T frame crc detects corruption");
+    ok &= expect_true(
+        validate_t2t_atp_snapshot_frame_detailed(corrupted_frame) ==
+            T2TFrameValidationResult::SNAPSHOT_CRC_ERROR,
+        "T2T frame reports snapshot CRC error");
 
     if (!ok) {
         std::cerr << "[RESULT] ATP adapter tests failed.\n";

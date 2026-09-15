@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstring>
+#include <cerrno>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -13,6 +14,9 @@
 #include <ctime>
 #include <string>
 #include "atp_adapter.hpp"
+#include "comm_health.hpp"
+#include "comm_safety_action.hpp"
+#include "comm_safety_supervisor.hpp"
 #include "network_proto.hpp"
 #include "perception.hpp"
 #include "t2t_radio.hpp" 
@@ -74,6 +78,34 @@ int get_env_int(const char* name, int default_value) {
     return value ? std::atoi(value) : default_value;
 }
 
+CommSafetyThresholds get_comm_safety_thresholds() {
+    CommSafetyThresholds thresholds;
+    thresholds.degraded_ms = get_env_float("VCU_COMM_DEGRADED_AOI_MS", thresholds.degraded_ms);
+    thresholds.blind_run_ms = get_env_float("VCU_COMM_BLIND_AOI_MS", thresholds.blind_run_ms);
+    thresholds.fail_safe_ms = get_env_float("VCU_COMM_FAIL_SAFE_AOI_MS", thresholds.fail_safe_ms);
+    thresholds.recover_normal_ms = get_env_float("VCU_COMM_RECOVER_NORMAL_AOI_MS", thresholds.recover_normal_ms);
+    thresholds.recover_degraded_ms = get_env_float("VCU_COMM_RECOVER_DEGRADED_AOI_MS", thresholds.recover_degraded_ms);
+    int recovery_count = get_env_int("VCU_COMM_RECOVERY_GOOD_SNAPSHOTS",
+                                     static_cast<int>(thresholds.recovery_good_snapshots));
+    thresholds.recovery_good_snapshots = recovery_count > 0 ? static_cast<uint32_t>(recovery_count) : 0u;
+    return thresholds;
+}
+
+CommSafetyActionPolicy get_comm_safety_action_policy() {
+    CommSafetyActionPolicy policy;
+    policy.degraded_traction_limit_ratio = get_env_float(
+        "VCU_COMM_ACTION_DEGRADED_TRACTION_RATIO", policy.degraded_traction_limit_ratio);
+    policy.degraded_uncertainty_extra_m = get_env_float(
+        "VCU_COMM_ACTION_DEGRADED_UNCERTAINTY_M", policy.degraded_uncertainty_extra_m);
+    policy.blind_run_traction_limit_ratio = get_env_float(
+        "VCU_COMM_ACTION_BLIND_TRACTION_RATIO", policy.blind_run_traction_limit_ratio);
+    policy.blind_run_uncertainty_extra_m = get_env_float(
+        "VCU_COMM_ACTION_BLIND_UNCERTAINTY_M", policy.blind_run_uncertainty_extra_m);
+    policy.fail_safe_uncertainty_extra_m = get_env_float(
+        "VCU_COMM_ACTION_FAIL_SAFE_UNCERTAINTY_M", policy.fail_safe_uncertainty_extra_m);
+    return policy;
+}
+
 struct PeerHealthState {
     bool enabled = false;
     bool has_valid = false;
@@ -92,6 +124,201 @@ struct PeerHealthState {
     char last_src_ip[INET_ADDRSTRLEN] = {0};
     uint16_t last_src_port = 0;
 };
+
+// Local observation of the peer's safety-relevant state stream. PeerHealth is
+// supplementary; this receiver is the authoritative record of snapshot arrival.
+struct PeerSnapshotState {
+    bool enabled = false;
+    bool has_valid = false;
+    int sd = -1;
+    uint16_t listen_port = VCU_PEER_PORT;
+    uint32_t expected_sender_id = T2T_BROADCAST_TRAIN_ID;
+    bool has_expected_source_ip = false;
+    in_addr expected_source_addr = {};
+    char expected_source_ip[INET_ADDRSTRLEN] = {0};
+    uint32_t last_seq = 0;
+    uint32_t received_count = 0;
+    uint32_t seq_gap_count = 0;
+    uint64_t missing_snapshot_count = 0;
+    uint32_t current_burst_loss_count = 0;
+    uint32_t max_burst_loss_count = 0;
+    uint32_t duplicate_count = 0;
+    uint32_t replay_count = 0;
+    uint32_t invalid_count = 0;
+    uint32_t crc_error_count = 0;
+    uint32_t wrong_sender_count = 0;
+    uint32_t wrong_source_count = 0;
+    uint32_t wrong_destination_count = 0;
+    uint32_t stale_timestamp_count = 0;
+    uint64_t max_timestamp_age_us = 0;
+    uint64_t last_rx_us = 0;
+    float last_timestamp_age_ms = 999999.0f;
+    T2TAtpSnapshotFrame latest = {};
+    char last_src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t last_src_port = 0;
+};
+
+bool init_peer_snapshot_receiver(PeerSnapshotState& state, RuntimeMode runtime_mode) {
+    if (get_env_int("VCU_PEER_SNAPSHOT_RX", 1) == 0) {
+        std::cout << "[PEER_SNAPSHOT_RX] Disabled by VCU_PEER_SNAPSHOT_RX=0\n";
+        return false;
+    }
+
+    int listen_port = get_env_int("VCU_PEER_SNAPSHOT_PORT", VCU_PEER_PORT);
+    if (listen_port <= 0 || listen_port > 65535) {
+        std::cerr << "[PEER_SNAPSHOT_RX] Invalid VCU_PEER_SNAPSHOT_PORT: " << listen_port << "\n";
+        return false;
+    }
+    state.listen_port = static_cast<uint16_t>(listen_port);
+
+    int expected_peer = get_env_int("VCU_EXPECTED_PEER_ID", -1);
+    state.expected_sender_id = (expected_peer >= 0)
+                                   ? static_cast<uint32_t>(expected_peer)
+                                   : T2T_BROADCAST_TRAIN_ID;
+    const char* expected_ip = std::getenv("VCU_EXPECTED_PEER_IP");
+    if (expected_ip != nullptr && expected_ip[0] != '\0') {
+        if (inet_pton(AF_INET, expected_ip, &state.expected_source_addr) != 1) {
+            std::cerr << "[PEER_SNAPSHOT_RX] Invalid VCU_EXPECTED_PEER_IP: " << expected_ip << "\n";
+            return false;
+        }
+        state.has_expected_source_ip = true;
+        std::strncpy(state.expected_source_ip, expected_ip, sizeof(state.expected_source_ip) - 1);
+    }
+
+    // Timestamp age is meaningful only when hosts have a common PTP/TAI clock.
+    float max_age_ms = get_env_float("VCU_PEER_MAX_TIMESTAMP_AGE_MS", 0.0f);
+    state.max_timestamp_age_us = max_age_ms > 0.0f
+                                     ? static_cast<uint64_t>(max_age_ms * 1000.0f)
+                                     : 0;
+
+    state.sd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state.sd < 0) {
+        std::perror("[PEER_SNAPSHOT_RX] socket");
+        return false;
+    }
+    int reuse_addr = 1;
+    setsockopt(state.sd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+
+    sockaddr_in bind_addr = {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(state.listen_port);
+    const char* bind_ip = std::getenv("VCU_PEER_SNAPSHOT_BIND_IP");
+    if (bind_ip == nullptr || bind_ip[0] == '\0') {
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, bind_ip, &bind_addr.sin_addr) != 1) {
+        std::cerr << "[PEER_SNAPSHOT_RX] Invalid VCU_PEER_SNAPSHOT_BIND_IP: " << bind_ip << "\n";
+        close(state.sd);
+        state.sd = -1;
+        return false;
+    }
+    if (bind(state.sd, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+        std::perror("[PEER_SNAPSHOT_RX] bind");
+        close(state.sd);
+        state.sd = -1;
+        return false;
+    }
+
+    state.enabled = true;
+    std::cout << "[PEER_SNAPSHOT_RX] Listening on UDP port " << state.listen_port;
+    if (state.expected_sender_id != T2T_BROADCAST_TRAIN_ID) std::cout << " expected_peer=" << state.expected_sender_id;
+    if (state.has_expected_source_ip) std::cout << " expected_ip=" << state.expected_source_ip;
+    if (state.max_timestamp_age_us > 0) std::cout << " max_timestamp_age_ms=" << state.max_timestamp_age_us / 1000.0f;
+    std::cout << "\n";
+    return true;
+}
+
+void poll_peer_snapshot(PeerSnapshotState& state, RuntimeMode runtime_mode, uint32_t local_train_id) {
+    if (!state.enabled || state.sd < 0) return;
+
+    while (true) {
+        T2TAtpSnapshotFrame frame = {};
+        sockaddr_in src_addr = {};
+        socklen_t src_len = sizeof(src_addr);
+        ssize_t n = recvfrom(state.sd, &frame, sizeof(frame), MSG_DONTWAIT,
+                             reinterpret_cast<sockaddr*>(&src_addr), &src_len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            std::perror("[PEER_SNAPSHOT_RX] recvfrom");
+            return;
+        }
+        if (n != static_cast<ssize_t>(sizeof(frame))) {
+            state.invalid_count++;
+            continue;
+        }
+        T2TFrameValidationResult validation = validate_t2t_atp_snapshot_frame_detailed(frame);
+        if (validation != T2TFrameValidationResult::VALID) {
+            state.invalid_count++;
+            if (validation == T2TFrameValidationResult::SNAPSHOT_CRC_ERROR ||
+                validation == T2TFrameValidationResult::FRAME_CRC_ERROR) {
+                state.crc_error_count++;
+            }
+            continue;
+        }
+        if (state.expected_sender_id != T2T_BROADCAST_TRAIN_ID &&
+            frame.header.source_train_id != state.expected_sender_id) {
+            state.wrong_sender_count++;
+            continue;
+        }
+        char src_ip[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &src_addr.sin_addr, src_ip, sizeof(src_ip));
+        if (state.has_expected_source_ip &&
+            src_addr.sin_addr.s_addr != state.expected_source_addr.s_addr) {
+            state.wrong_source_count++;
+            continue;
+        }
+        if (frame.header.dest_train_id != local_train_id &&
+            frame.header.dest_train_id != T2T_BROADCAST_TRAIN_ID) {
+            state.wrong_destination_count++;
+            continue;
+        }
+
+        uint64_t now_us = get_runtime_time_us(runtime_mode);
+        state.last_timestamp_age_ms = 0.0f;
+        if (state.max_timestamp_age_us > 0) {
+            if (now_us < frame.header.tai_timestamp_us ||
+                now_us - frame.header.tai_timestamp_us > state.max_timestamp_age_us) {
+                state.stale_timestamp_count++;
+                continue;
+            }
+            state.last_timestamp_age_ms = static_cast<float>(now_us - frame.header.tai_timestamp_us) / 1000.0f;
+        }
+
+        if (state.has_valid) {
+            if (frame.header.seq == state.last_seq) {
+                state.duplicate_count++;
+                continue;
+            }
+            // uint32_t subtraction preserves correct ordering across sequence wrap.
+            if (static_cast<int32_t>(frame.header.seq - state.last_seq) < 0) {
+                state.replay_count++;
+                continue;
+            }
+            if (frame.header.seq != state.last_seq + 1u) {
+                uint32_t missing = frame.header.seq - state.last_seq - 1u;
+                state.seq_gap_count++;
+                state.missing_snapshot_count += missing;
+                state.current_burst_loss_count = missing;
+                state.max_burst_loss_count = std::max(state.max_burst_loss_count, missing);
+            } else {
+                state.current_burst_loss_count = 0;
+            }
+        }
+
+        state.has_valid = true;
+        state.latest = frame;
+        state.last_seq = frame.header.seq;
+        state.last_rx_us = now_us;
+        state.received_count++;
+        std::strncpy(state.last_src_ip, src_ip, sizeof(state.last_src_ip) - 1);
+        state.last_src_port = ntohs(src_addr.sin_port);
+    }
+}
+
+float peer_snapshot_rx_aoi_ms(const PeerSnapshotState& state, RuntimeMode runtime_mode) {
+    if (!state.has_valid) return 999999.0f;
+    uint64_t now_us = get_runtime_time_us(runtime_mode);
+    return now_us >= state.last_rx_us ? static_cast<float>(now_us - state.last_rx_us) / 1000.0f : 0.0f;
+}
 
 bool init_peer_health_receiver(PeerHealthState& state) {
     if (get_env_int("VCU_PEER_HEALTH_RX", 1) == 0) {
@@ -197,6 +424,36 @@ float peer_health_rx_aoi_ms(const PeerHealthState& state, RuntimeMode runtime_mo
     if (!state.has_valid) return 999999.0f;
     uint64_t now_us = get_runtime_time_us(runtime_mode);
     return (now_us >= state.last_rx_us) ? static_cast<float>(now_us - state.last_rx_us) / 1000.0f : 0.0f;
+}
+
+CommHealthState build_comm_health_state(const PeerSnapshotState& snapshot,
+                                        const PeerHealthState& health,
+                                        RuntimeMode runtime_mode) {
+    CommHealthState state;
+    state.peer_present = snapshot.has_valid;
+    state.snapshot_valid = snapshot.has_valid;
+    state.last_valid_rx_us = snapshot.last_rx_us;
+    state.snapshot_rx_aoi_ms = peer_snapshot_rx_aoi_ms(snapshot, runtime_mode);
+    state.last_seq = snapshot.has_valid ? snapshot.last_seq : 0u;
+    state.rx_count = snapshot.received_count;
+    state.seq_gap_count = snapshot.seq_gap_count;
+    state.missing_snapshot_count = snapshot.missing_snapshot_count;
+    state.current_burst_loss_count = snapshot.current_burst_loss_count;
+    state.max_burst_loss_count = snapshot.max_burst_loss_count;
+    state.invalid_count = snapshot.invalid_count;
+    state.crc_error_count = snapshot.crc_error_count;
+    state.wrong_sender_count = snapshot.wrong_sender_count;
+    state.wrong_source_count = snapshot.wrong_source_count;
+    state.wrong_destination_count = snapshot.wrong_destination_count;
+    state.duplicate_count = snapshot.duplicate_count;
+    state.replay_count = snapshot.replay_count;
+    state.stale_timestamp_count = snapshot.stale_timestamp_count;
+    state.peer_health_valid = health.has_valid;
+    state.peer_health_rx_aoi_ms = peer_health_rx_aoi_ms(health, runtime_mode);
+    state.peer_reported_aoi_ms = health.has_valid ? health.latest.peer_aoi_ms : 999999.0f;
+    state.peer_reported_network = health.has_valid ? health.latest.network_health : STATUS_DEGRADED_UU;
+    state.peer_health_seq = health.has_valid ? health.latest.seq : 0u;
+    return state;
 }
 
 // 包含了死区与弹性系数的控制器
@@ -312,8 +569,41 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    PeerSnapshotState peer_snapshot;
+    init_peer_snapshot_receiver(peer_snapshot, runtime_mode);
+
     PeerHealthState peer_health;
     init_peer_health_receiver(peer_health);
+
+    bool comm_safety_shadow_enabled = get_env_int("VCU_COMM_SAFETY_SHADOW", 0) != 0;
+    CommSafetyThresholds comm_safety_thresholds = get_comm_safety_thresholds();
+    if (!comm_safety_thresholds.is_valid()) {
+        std::cerr << "[COMM_SAFETY] Invalid threshold configuration; using research/shadow defaults.\n";
+        comm_safety_thresholds = CommSafetyThresholds{};
+    }
+    CommSafetySupervisor comm_safety_supervisor(comm_safety_thresholds);
+    bool comm_action_shadow_enabled = get_env_int("VCU_COMM_ACTION_SHADOW", 0) != 0;
+    CommSafetyActionPolicy comm_action_policy = get_comm_safety_action_policy();
+    if (!comm_action_policy.is_valid()) {
+        std::cerr << "[COMM_ACTION] Invalid action policy; using research/shadow defaults.\n";
+        comm_action_policy = CommSafetyActionPolicy{};
+    }
+    CommSafetyActionResolver comm_action_resolver(comm_action_policy);
+    if (comm_action_shadow_enabled && !comm_safety_shadow_enabled) {
+        std::cerr << "[COMM_ACTION] Shadow output requires VCU_COMM_SAFETY_SHADOW=1; action shadow disabled.\n";
+        comm_action_shadow_enabled = false;
+    }
+    if (comm_safety_shadow_enabled) {
+        std::cout << "[COMM_SAFETY] Shadow mode enabled: degraded=" << comm_safety_thresholds.degraded_ms
+                  << "ms blind=" << comm_safety_thresholds.blind_run_ms
+                  << "ms fail=" << comm_safety_thresholds.fail_safe_ms
+                  << "ms recovery_good_snapshots=" << comm_safety_thresholds.recovery_good_snapshots << "\n";
+    }
+    if (comm_action_shadow_enabled) {
+        std::cout << "[COMM_ACTION] Shadow mode enabled: degraded_traction_ratio="
+                  << comm_action_policy.degraded_traction_limit_ratio
+                  << " blind_traction_ratio=" << comm_action_policy.blind_run_traction_limit_ratio << "\n";
+    }
 
     T2T_Radio lora_radio;
     const char* lora_dev = std::getenv("LORA_DEV");
@@ -333,7 +623,23 @@ int main(int argc, char* argv[]) {
             << "PlannedBlind,BlindDistance(m),BlindRiskLevel,"
             << "PeerHealthValid,PeerHealthRxAoI(ms),PeerReportedAoI(ms),PeerHealthNetwork,"
             << "PeerHealthSeq,PeerHealthRxCount,PeerHealthSeqGapCount,PeerHealthInvalidCount,"
-            << "PeerHealthWrongSourceCount,PeerHealthLastInvalidSize,PeerHealthLastInvalidHeader\n";
+            << "PeerHealthWrongSourceCount,PeerHealthLastInvalidSize,PeerHealthLastInvalidHeader,"
+            << "PeerSnapshotValid,PeerSnapshotRxAoI(ms),PeerSnapshotTimestampAge(ms),PeerSnapshotSeq,"
+            << "PeerSnapshotRxCount,PeerSnapshotSeqGapCount,PeerSnapshotDuplicateCount,PeerSnapshotReplayCount,"
+            << "PeerSnapshotInvalidCount,PeerSnapshotWrongSourceCount,PeerSnapshotWrongDestCount,"
+            << "PeerSnapshotStaleTimestampCount,PeerSnapshotMissingCount,PeerSnapshotCurrentBurstLoss,"
+            << "PeerSnapshotMaxBurstLoss,PeerSnapshotCrcErrorCount,PeerSnapshotWrongSenderCount,"
+            << "CommPeerPresent,CommSnapshotValid,CommSnapshotRxAoI(ms),CommLastValidRx(us),CommLastSeq,"
+            << "CommRxCount,CommSeqGapCount,CommMissingSnapshotCount,CommCurrentBurstLoss,CommMaxBurstLoss,"
+            << "CommInvalidCount,CommCrcErrorCount,CommWrongSenderCount,CommWrongSourceCount,"
+            << "CommWrongDestCount,CommDuplicateCount,CommReplayCount,CommStaleTimestampCount,"
+            << "CommPeerHealthValid,CommPeerHealthRxAoI(ms),CommPeerReportedAoI(ms),"
+            << "CommPeerReportedNetwork,CommPeerHealthSeq,"
+            << "CommSafetyShadowEnabled,CommSafetyShadowActive,CommSafetyProposedState,CommSafetyReason,"
+            << "CommSafetyGoodSnapshotStreak,CommSafetyStateChanged,"
+            << "CommActionShadowEnabled,CommActionShadowActive,CommActionSourceState,CommActionSourceReason,"
+            << "CommActionTractionPermitted,CommActionCooperativeFollowingPermitted,CommActionBlindRunActive,"
+            << "CommActionFailSafeBrakeRequested,CommActionTractionLimitRatio,CommActionUncertaintyExtra(m)\n";
 
     float TARGET_CRUISE_VEL = 24.5f; // 目标巡航速度88
 
@@ -349,6 +655,9 @@ int main(int argc, char* argv[]) {
     uint32_t snapshot_seq = 0;
     uint32_t t2t_snapshot_frame_seq = 0;
     AtpSnapshot local_snapshot = {};
+    CommHealthState comm_health;
+    CommSafetyDecision comm_safety_decision;
+    CommSafetyAction comm_safety_action;
 
     HardwareWatchdog hw_wd; 
     hw_wd.pet(); // 强制完成第一次喂狗，重置计时器
@@ -359,6 +668,13 @@ int main(int argc, char* argv[]) {
     float startup_grace_ms = Safety::kStartupGraceMs;
     if (const char* grace_env = std::getenv("VCU_STARTUP_GRACE_MS")) {
         startup_grace_ms = std::max(0.0f, static_cast<float>(std::atof(grace_env)));
+    }
+    float comm_safety_startup_grace_ms = std::max(
+        0.0f, get_env_float("VCU_COMM_SAFETY_STARTUP_GRACE_MS", Safety::kStartupGraceMs));
+    bool comm_safety_shadow_active = false;
+    bool comm_action_shadow_active = false;
+    if (comm_safety_shadow_enabled) {
+        std::cout << "[COMM_SAFETY] Shadow startup grace=" << comm_safety_startup_grace_ms << "ms\n";
     }
     float hil_degraded_aoi_ms = std::max(0.0f, get_env_float("VCU_HIL_DEGRADED_AOI_MS", 30.0f));
 
@@ -376,7 +692,9 @@ int main(int argc, char* argv[]) {
         kf.predict(dt);
         time_since_last_tx += dt;
         total_ticks++;
+        poll_peer_snapshot(peer_snapshot, runtime_mode, static_cast<uint32_t>(id));
         poll_peer_health(peer_health, runtime_mode);
+        comm_health = build_comm_health_state(peer_snapshot, peer_health, runtime_mode);
 
         
         //1.SAFETY PLANE (LoRa Asynchronous EB Polling)
@@ -477,6 +795,22 @@ int main(int argc, char* argv[]) {
         float current_aoi_ms = (get_runtime_time_us(runtime_mode) - last_rx_timestamp_us) / 1000.0f;
         float since_boot_ms = (get_runtime_time_us(runtime_mode) - boot_timestamp_us) / 1000.0f;
         bool startup_grace_active = !has_received_feedback && since_boot_ms < startup_grace_ms;
+        comm_safety_shadow_active = comm_safety_shadow_enabled &&
+                                    since_boot_ms >= comm_safety_startup_grace_ms;
+        if (comm_safety_shadow_active) {
+            comm_safety_decision = comm_safety_supervisor.update(comm_health);
+            if (comm_action_shadow_enabled) {
+                comm_safety_action = comm_action_resolver.resolve(comm_safety_decision);
+                comm_action_shadow_active = true;
+            }
+            if (comm_safety_decision.changed) {
+                std::cout << "[COMM_SAFETY] proposed=" << to_string(comm_safety_decision.state)
+                          << " reason=" << to_string(comm_safety_decision.reason)
+                          << " aoi_ms=" << comm_health.snapshot_rx_aoi_ms << "\n";
+            }
+        } else {
+            comm_action_shadow_active = false;
+        }
         if (!startup_grace_active && current_aoi_ms > Safety::kBlindEntryAoiMs &&
             net_state != NetworkHealth::BLIND_KINEMATIC) {
             net_state = NetworkHealth::BLIND_KINEMATIC;
@@ -646,21 +980,54 @@ int main(int argc, char* argv[]) {
         // 7. 遥测与日志输出
         if (tick_counter % 10 == 0 || simulation_complete) {
             float time_s = total_ticks * dt; 
-            float peer_health_rx_aoi = peer_health_rx_aoi_ms(peer_health, runtime_mode);
-            float peer_reported_aoi = peer_health.has_valid ? peer_health.latest.peer_aoi_ms : 999999.0f;
-            uint32_t peer_network_health = peer_health.has_valid ? peer_health.latest.network_health : STATUS_DEGRADED_UU;
-            uint32_t peer_health_seq = peer_health.has_valid ? peer_health.latest.seq : 0u;
             vcu_log << time_s << "," << current_aoi_ms << "," << burst_loss_count << ","
                     << last_time_diff_us << "," << estimated_gap << "," << sdvcu.current_safe_gap << ","
                     << report_status << "," << effective_delay_s << "," << uncertainty_buffer << ","
                     << safety_margin << "," << (in_tunnel ? 1 : 0) << "," << (nlos_curve ? 1 : 0) << ","
                     << (planned_blind_run ? 1 : 0) << "," << blind_distance_m << "," << blind_risk_level << ","
-                    << (peer_health.has_valid ? 1 : 0) << "," << peer_health_rx_aoi << ","
-                    << peer_reported_aoi << "," << peer_network_health << ","
-                    << peer_health_seq << "," << peer_health.received_count << ","
+                    << (peer_health.has_valid ? 1 : 0) << "," << comm_health.peer_health_rx_aoi_ms << ","
+                    << comm_health.peer_reported_aoi_ms << "," << comm_health.peer_reported_network << ","
+                    << comm_health.peer_health_seq << "," << peer_health.received_count << ","
                     << peer_health.seq_gap_count << "," << peer_health.invalid_count << ","
                     << peer_health.wrong_source_count << "," << peer_health.last_invalid_size << ","
-                    << peer_health.last_invalid_header << "\n";
+                    << peer_health.last_invalid_header << ","
+                    << (peer_snapshot.has_valid ? 1 : 0) << "," << comm_health.snapshot_rx_aoi_ms << ","
+                    << peer_snapshot.last_timestamp_age_ms << "," << comm_health.last_seq << ","
+                    << peer_snapshot.received_count << "," << peer_snapshot.seq_gap_count << ","
+                    << peer_snapshot.duplicate_count << "," << peer_snapshot.replay_count << ","
+                    << peer_snapshot.invalid_count << "," << peer_snapshot.wrong_source_count << ","
+                    << peer_snapshot.wrong_destination_count << "," << peer_snapshot.stale_timestamp_count << ","
+                    << peer_snapshot.missing_snapshot_count << "," << peer_snapshot.current_burst_loss_count << ","
+                    << peer_snapshot.max_burst_loss_count << "," << peer_snapshot.crc_error_count << ","
+                    << peer_snapshot.wrong_sender_count << ","
+                    << (comm_health.peer_present ? 1 : 0) << "," << (comm_health.snapshot_valid ? 1 : 0) << ","
+                    << comm_health.snapshot_rx_aoi_ms << "," << comm_health.last_valid_rx_us << ","
+                    << comm_health.last_seq << "," << comm_health.rx_count << ","
+                    << comm_health.seq_gap_count << "," << comm_health.missing_snapshot_count << ","
+                    << comm_health.current_burst_loss_count << "," << comm_health.max_burst_loss_count << ","
+                    << comm_health.invalid_count << "," << comm_health.crc_error_count << ","
+                    << comm_health.wrong_sender_count << "," << comm_health.wrong_source_count << ","
+                    << comm_health.wrong_destination_count << "," << comm_health.duplicate_count << ","
+                    << comm_health.replay_count << "," << comm_health.stale_timestamp_count << ","
+                    << (comm_health.peer_health_valid ? 1 : 0) << "," << comm_health.peer_health_rx_aoi_ms << ","
+                    << comm_health.peer_reported_aoi_ms << "," << comm_health.peer_reported_network << ","
+                    << comm_health.peer_health_seq << ","
+                    << (comm_safety_shadow_enabled ? 1 : 0) << ","
+                    << (comm_safety_shadow_active ? 1 : 0) << ","
+                    << static_cast<uint32_t>(comm_safety_decision.state) << ","
+                    << static_cast<uint32_t>(comm_safety_decision.reason) << ","
+                    << comm_safety_decision.consecutive_good_snapshots << ","
+                    << (comm_safety_decision.changed ? 1 : 0) << ","
+                    << (comm_action_shadow_enabled ? 1 : 0) << ","
+                    << (comm_action_shadow_active ? 1 : 0) << ","
+                    << static_cast<uint32_t>(comm_safety_action.source_state) << ","
+                    << static_cast<uint32_t>(comm_safety_action.source_reason) << ","
+                    << (comm_safety_action.traction_permitted ? 1 : 0) << ","
+                    << (comm_safety_action.cooperative_following_permitted ? 1 : 0) << ","
+                    << (comm_safety_action.blind_run_active ? 1 : 0) << ","
+                    << (comm_safety_action.fail_safe_brake_requested ? 1 : 0) << ","
+                    << comm_safety_action.traction_limit_ratio << ","
+                    << comm_safety_action.uncertainty_extra_m << "\n";
             // warning:real sys移除flush，转为异步队列写入
             vcu_log.flush(); 
         }
@@ -728,6 +1095,54 @@ int main(int argc, char* argv[]) {
                     peer_health.invalid_count,
                     peer_health.wrong_source_count);
             }
+            if (peer_snapshot.enabled) {
+                std::printf("[PEER_SNAPSHOT_RX] Valid:%d | Peer:%u | Src:%s:%u | RxAoI:%6.1fms | TsAge:%6.1fms | Seq:%u | Rx:%u | GapEvents:%u | Missing:%llu | Burst:%u/%u | Dup:%u | Replay:%u | Invalid:%u | CRC:%u | WrongSender:%u | WrongSrc:%u | WrongDest:%u | Stale:%u\n",
+                    peer_snapshot.has_valid ? 1 : 0,
+                    peer_snapshot.has_valid ? peer_snapshot.latest.header.source_train_id : 0u,
+                    peer_snapshot.has_valid ? peer_snapshot.last_src_ip : "-",
+                    peer_snapshot.has_valid ? peer_snapshot.last_src_port : 0u,
+                    peer_snapshot_rx_aoi_ms(peer_snapshot, runtime_mode),
+                    peer_snapshot.last_timestamp_age_ms,
+                    peer_snapshot.has_valid ? peer_snapshot.last_seq : 0u,
+                    peer_snapshot.received_count,
+                    peer_snapshot.seq_gap_count,
+                    static_cast<unsigned long long>(peer_snapshot.missing_snapshot_count),
+                    peer_snapshot.current_burst_loss_count,
+                    peer_snapshot.max_burst_loss_count,
+                    peer_snapshot.duplicate_count,
+                    peer_snapshot.replay_count,
+                    peer_snapshot.invalid_count,
+                    peer_snapshot.crc_error_count,
+                    peer_snapshot.wrong_sender_count,
+                    peer_snapshot.wrong_source_count,
+                    peer_snapshot.wrong_destination_count,
+                    peer_snapshot.stale_timestamp_count);
+            }
+            std::printf("[COMM_HEALTH] PeerPresent:%d | SnapshotValid:%d | AoI:%6.1fms | Missing:%llu | Burst:%u/%u | HealthCrossCheck:%d\n",
+                comm_health.peer_present ? 1 : 0,
+                comm_health.snapshot_valid ? 1 : 0,
+                comm_health.snapshot_rx_aoi_ms,
+                static_cast<unsigned long long>(comm_health.missing_snapshot_count),
+                comm_health.current_burst_loss_count,
+                comm_health.max_burst_loss_count,
+                comm_health.peer_health_valid ? 1 : 0);
+            if (comm_safety_shadow_enabled) {
+                std::printf("[COMM_SAFETY] Proposed:%s | Reason:%s | GoodSnapshots:%u | Changed:%d\n",
+                    to_string(comm_safety_decision.state),
+                    to_string(comm_safety_decision.reason),
+                    comm_safety_decision.consecutive_good_snapshots,
+                    comm_safety_shadow_active && comm_safety_decision.changed ? 1 : 0);
+            }
+            if (comm_action_shadow_active) {
+                std::printf("[COMM_ACTION] Source:%s | Traction:%d | Ratio:%.2f | Cooperative:%d | Blind:%d | FailBrakeReq:%d | ExtraUncert:%.1fm\n",
+                    to_string(comm_safety_action.source_state),
+                    comm_safety_action.traction_permitted ? 1 : 0,
+                    comm_safety_action.traction_limit_ratio,
+                    comm_safety_action.cooperative_following_permitted ? 1 : 0,
+                    comm_safety_action.blind_run_active ? 1 : 0,
+                    comm_safety_action.fail_safe_brake_requested ? 1 : 0,
+                    comm_safety_action.uncertainty_extra_m);
+            }
             tick_counter = 0;
         }
 
@@ -738,6 +1153,7 @@ int main(int argc, char* argv[]) {
 
         std::this_thread::sleep_until(loop_start + std::chrono::milliseconds(10));
     }
+    if (peer_snapshot.sd >= 0) close(peer_snapshot.sd);
     if (peer_health.sd >= 0) close(peer_health.sd);
     if (t2t_snapshot_sd >= 0) close(t2t_snapshot_sd);
     if (srv_sd >= 0) close(srv_sd);

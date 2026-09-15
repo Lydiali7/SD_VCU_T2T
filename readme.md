@@ -2,6 +2,8 @@
 
 This project is a research and HIL-oriented prototype for heavy-haul virtual train coupling. It models a five-train formation, runs a software-defined VCU control node, evaluates T2T communication behavior, and now includes an engineering-oriented packet boundary based on normalized onboard train-state snapshots.
 
+For the current Chinese project description, completed HIL evidence, engineering boundaries, and next-stage plan, see [docs/project_status_zh.md](docs/project_status_zh.md).
+
 The current code is best understood as:
 
 ```text
@@ -14,7 +16,10 @@ world_server physics and feedback
 vcu_node control, safety envelope, AoI, blind-run handling
         |
         v
-normalized AtpSnapshot + optional T2T engineering frame
+normalized AtpSnapshot + bidirectional T2T peer snapshot
+        |
+        v
+CommHealthState -> shadow CommSafetySupervisor -> shadow CommSafetyAction
 ```
 
 It is not yet a certified ATP/TCMS integration. Real ATP/TCMS/MVB/CAN field mapping still requires the actual interface control document, ICD.
@@ -70,8 +75,15 @@ It is not yet a certified ATP/TCMS integration. Real ATP/TCMS/MVB/CAN field mapp
 | `include/mvb_hal.hpp` | MVB serial device setup and frame read/write |
 | `include/t2t_radio.hpp` | LoRa/E22 serial radio wrapper |
 | `include/safety_config.hpp` | Safety thresholds and control constants |
+| `include/comm_health.hpp` | Normalized peer communication-health contract |
+| `include/comm_safety_supervisor.hpp` | Shadow communication-safety state-machine interface |
+| `include/comm_safety_action.hpp` | Shadow communication-safety action resolver interface |
+| `src/comm_safety_supervisor.cpp` | Hysteretic AoI-based safety policy implementation |
+| `src/comm_safety_action.cpp` | State-to-action matrix implementation |
 | `tools/t2t_snapshot_dump.cpp` | Passive T2T snapshot receiver and protocol validator |
-| `tools/mock_peer.cpp` | Mock peer OBU: receives snapshots, tracks AoI, optionally sends peer health |
+| `tools/mock_peer.cpp` | Mock peer OBU: receives local snapshots, publishes modeled peer snapshots, and sends peer health |
+| `tests/test_comm_safety_supervisor.cpp` | Boundary, recovery, and fail-safe latch tests |
+| `tests/test_comm_safety_action.cpp` | Shadow action-matrix tests |
 | `run_tmux.sh` | SIM-mode tmux dashboard launcher |
 | `Makefile` | Builds runtime binaries and protocol test tools |
 | `fleet_log.csv` | World-server fleet log output |
@@ -424,6 +436,24 @@ store latest peer state
 track peer AoI and sequence gaps
 optionally inject receiver-side delay/drop
 optionally send PeerHealthPacket periodically
+publish a modeled peer AtpSnapshot back to the VCU
+```
+
+The safety ownership is deliberately asymmetric only in the test harness, not in the VCU decision model:
+
+```text
+peer AtpSnapshot received by VCU
+        |
+        v
+local receive supervision: CRC, identity, destination, sequence, AoI
+        |
+        v
+CommHealthState -> shadow CommSafetySupervisor -> shadow CommSafetyAction
+
+PeerHealthPacket
+        |
+        v
+cross-check and diagnostic input only
 ```
 
 Start a mock peer receiver:
@@ -463,7 +493,7 @@ The mock output prints the actual health target and byte count:
 [PEER_HEALTH] seq=... target=10.42.0.33:9101 bytes=48 ...
 ```
 
-`vcu_node` now has a non-blocking `PeerHealthPacket` receiver. It observes peer health and writes it to `vcu_telemetry.csv`; it does not yet change braking or safety state.
+`vcu_node` has a non-blocking `PeerHealthPacket` receiver. It writes peer health to `vcu_telemetry.csv` as a secondary diagnostic cross-check; it does not directly drive the controller, braking, or communication-safety state. The local peer-snapshot receiver is the primary evidence source.
 
 On the VCU side:
 
@@ -478,9 +508,57 @@ With this setup:
 
 ```text
 vcu_node sends AtpSnapshot to mock_peer on 9100
+mock_peer publishes a modeled Train 2 AtpSnapshot to vcu_node on 9100
 mock_peer sends PeerHealthPacket back to vcu_node on 9101
-vcu_node logs PeerHealthValid, PeerHealthRxAoI, PeerReportedAoI, source IP, received count, and peer seq-gap counters
+vcu_node locally validates and logs peer snapshot freshness, source, sequence gaps, duplicates, replay attempts, and invalid frames
+vcu_node logs PeerHealth as cross-check telemetry
 ```
+
+For a two-host HIL test, run this on the PC/mock-peer host:
+
+```bash
+MOCK_PEER_HEALTH_IP=10.42.0.33 \
+MOCK_PEER_HEALTH_PORT=9101 \
+MOCK_PEER_SNAPSHOT_IP=10.42.0.33 \
+MOCK_PEER_SNAPSHOT_PORT=9100 \
+./mock_peer 9100 3
+```
+
+Run this on the VCU host:
+
+```bash
+SDVCU_MODE=HIL SERVER_IP=10.42.0.1 \
+T2T_SNAPSHOT_IP=10.42.0.1 T2T_SNAPSHOT_PORT=9100 \
+VCU_EXPECTED_PEER_ID=2 VCU_EXPECTED_PEER_IP=10.42.0.1 \
+VCU_PEER_SNAPSHOT_PORT=9100 VCU_PEER_HEALTH_PORT=9101 \
+./vcu_node 3 --hil
+```
+
+`PeerSnapshotRxAoI` is the local authoritative age of the most recently accepted peer state. `PeerHealthRxAoI` is only the age of the diagnostic health message.
+
+`vcu_node` aggregates receiver observations into `CommHealthState` (Phase 2A), then evaluates it through the hysteretic `CommSafetySupervisor` (Phase 2B) and `CommSafetyAction` resolver (Phase 2C-1). All three stages are currently shadow-only: they are logged but do not affect force, EB, ATP trip, uncertainty, legacy `NetworkHealth`, or fail-safe behavior.
+
+```text
+snapshot_rx_aoi_ms         age of the last fully accepted peer snapshot
+missing_snapshot_count     total inferred missing sequence numbers
+current_burst_loss_count   missing frames immediately before the latest accepted frame
+max_burst_loss_count       largest observed single loss burst
+crc_error_count            invalid snapshot/frame CRC count
+peer health fields         secondary cross-check information only
+```
+
+`SeqGapCount` means the number of discontinuity events. It is intentionally different from `MissingSnapshotCount`: a jump from sequence 100 to 105 is one gap event but four missing snapshots.
+
+When both `VCU_COMM_SAFETY_SHADOW=1` and `VCU_COMM_ACTION_SHADOW=1` are set, the VCU also resolves the proposed communication state into telemetry-only `CommSafetyAction` values:
+
+```text
+NORMAL          traction permitted, cooperative following permitted
+DEGRADED        traction ratio limited, added uncertainty
+BLIND_RUN       traction inhibited, cooperative following disabled, blind-run requested
+FAIL_SAFE_LOCK  traction inhibited, fail-safe brake requested
+```
+
+This is still shadow output. No current force, EB, ATP-trip, uncertainty, or fail-safe control path reads these action fields.
 
 Troubleshooting:
 
@@ -535,6 +613,25 @@ vcu_node Invalid increases
 | `VCU_PEER_BIND_IP` | `0.0.0.0` | Local bind IP for peer health receiver |
 | `VCU_PEER_HEALTH_PORT` | `9101` | Local UDP port for `PeerHealthPacket` |
 | `VCU_EXPECTED_PEER_ID` | unset | Expected mock peer sender id; unset means accept any |
+| `VCU_PEER_SNAPSHOT_RX` | `1` | Enable peer `T2TAtpSnapshotFrame` receiver |
+| `VCU_PEER_SNAPSHOT_PORT` | `9100` | Local UDP port for peer snapshots |
+| `VCU_PEER_SNAPSHOT_BIND_IP` | `0.0.0.0` | Local bind IP for peer snapshot receiver |
+| `VCU_EXPECTED_PEER_IP` | unset | Expected IPv4 source of peer snapshots; unset means accept any |
+| `VCU_PEER_MAX_TIMESTAMP_AGE_MS` | `0` | Optional peer timestamp-age rejection; enable only after PTP/TAI synchronization is verified |
+| `VCU_COMM_SAFETY_SHADOW` | `0` | Enable proposed communication safety state logging; never changes vehicle control |
+| `VCU_COMM_SAFETY_STARTUP_GRACE_MS` | `8000` | Delay shadow-policy evaluation after VCU boot |
+| `VCU_COMM_DEGRADED_AOI_MS` | `300` | Research/shadow AoI threshold for proposed `DEGRADED` |
+| `VCU_COMM_BLIND_AOI_MS` | `1000` | Research/shadow AoI threshold for proposed `BLIND_RUN` |
+| `VCU_COMM_FAIL_SAFE_AOI_MS` | `5000` | Research/shadow AoI threshold for proposed latched `FAIL_SAFE_LOCK` |
+| `VCU_COMM_RECOVER_NORMAL_AOI_MS` | `150` | AoI ceiling for `DEGRADED -> NORMAL` recovery snapshots |
+| `VCU_COMM_RECOVER_DEGRADED_AOI_MS` | `500` | AoI ceiling for `BLIND_RUN -> DEGRADED` recovery snapshots |
+| `VCU_COMM_RECOVERY_GOOD_SNAPSHOTS` | `3` | Consecutive accepted snapshots required for each recovery transition |
+| `VCU_COMM_ACTION_SHADOW` | `0` | Enable telemetry-only `CommSafetyAction` resolution; requires communication safety shadow mode |
+| `VCU_COMM_ACTION_DEGRADED_TRACTION_RATIO` | `0.60` | Research/shadow traction ratio proposed for `DEGRADED` |
+| `VCU_COMM_ACTION_DEGRADED_UNCERTAINTY_M` | `30` | Research/shadow extra uncertainty proposed for `DEGRADED` |
+| `VCU_COMM_ACTION_BLIND_TRACTION_RATIO` | `0` | Research/shadow traction ratio proposed for `BLIND_RUN` |
+| `VCU_COMM_ACTION_BLIND_UNCERTAINTY_M` | `100` | Research/shadow extra uncertainty proposed for `BLIND_RUN` |
+| `VCU_COMM_ACTION_FAIL_SAFE_UNCERTAINTY_M` | `150` | Research/shadow extra uncertainty proposed for `FAIL_SAFE_LOCK` |
 
 ### Mock Peer
 
@@ -548,6 +645,13 @@ vcu_node Invalid increases
 | `MOCK_PEER_HEALTH_PORT` | `9101` | UDP target port for peer health output |
 | `MOCK_PEER_HEALTH_PERIOD_MS` | `1000` | Peer health transmit period |
 | `MOCK_PEER_FRESH_TIMEOUT_MS` | `1000` | AoI freshness threshold used by mock health |
+| `MOCK_PEER_SNAPSHOT_TX` | `1` | Enable modeled peer snapshot transmission |
+| `MOCK_PEER_SNAPSHOT_IP` | unset | Explicit VCU target IP for modeled peer snapshots |
+| `MOCK_PEER_SNAPSHOT_AUTO_TARGET` | `1` | Auto-target the source IP of the latest received VCU snapshot |
+| `MOCK_PEER_SNAPSHOT_PORT` | `9100` | UDP target port for modeled peer snapshots |
+| `MOCK_PEER_SNAPSHOT_PERIOD_MS` | `50` | Modeled peer snapshot transmission period |
+| `MOCK_PEER_SNAPSHOT_GAP_M` | `400` | Position offset used to model the peer train ahead of the received VCU state |
+| `MOCK_PEER_SNAPSHOT_TX_DROP_PROB` | `0` | Probability of dropping modeled peer snapshots after sequence allocation |
 | `MOCK_PEER_RX_DROP_PROB` | `0` | Mock receiver-side packet drop probability |
 | `MOCK_PEER_RX_DELAY_BASE_MS` | `0` | Mock receiver-side base delay |
 | `MOCK_PEER_RX_DELAY_JITTER_MS` | `0` | Mock receiver-side random delay range |
@@ -618,21 +722,25 @@ tunnel / NLOS / blind-run indicators
 
 Recommended next steps:
 
-1. Validate bidirectional T2T HIL:
-   `vcu_node -> AtpSnapshot -> mock_peer -> PeerHealthPacket -> vcu_node`.
-2. Feed peer AoI and peer health into the safety supervisor.
-3. Drive `DEGRADED_UU`, `BLIND_RUN`, and `FAIL_SAFE_LOCK` from measured peer communication health.
-4. Extend mock-peer tests to cover clean link, degraded link, blind-run recovery, and fail-safe lock.
-5. Obtain ATP/TCMS/MVB/CAN ICDs for the real train interface.
-6. Add `build_snapshot_from_atp_gateway(...)`.
-7. Make `vcu_node` choose data source by mode:
+1. Completed: validate symmetric bidirectional T2T HIL:
+   `vcu_node -> AtpSnapshot -> mock_peer -> peer AtpSnapshot -> vcu_node`, with `PeerHealthPacket` as cross-check telemetry.
+2. Completed: aggregate VCU-local snapshot freshness and packet-validation results into telemetry-only `CommHealthState`.
+3. Completed: run `CommHealthState.snapshot_rx_aoi_ms` through a hysteretic, shadow-only `CommSafetySupervisor`.
+4. Completed: resolve proposed communication states into telemetry-only `CommSafetyAction` values.
+5. Completed: perform core physical-shadow HIL checks: clean link, 50% loss observation, 3 s recovery path, and 6 s fail-safe latch path.
+6. Connect reviewed communication safety actions to vehicle control, beginning with positive-traction inhibit/limit only.
+7. Add deterministic, optional snapshot-only blackout and delay/jitter/burst-loss test profiles to `mock_peer`.
+8. Define peer reboot/session-epoch handling before accepting a sequence reset.
+9. Obtain ATP/TCMS/MVB/CAN ICDs for the real train interface.
+10. Add `build_snapshot_from_atp_gateway(...)`.
+11. Make `vcu_node` choose data source by mode:
    - SIM fallback
    - HIL fallback
    - MVB/CAN gateway
    - ATP/TCMS gateway
-8. Cross-check peer-reported safety state against local safety envelope.
-9. Replace raw UDP research transport with authenticated, replay-protected safety communication.
-10. Move CSV logging to an async logger for real-time operation.
+12. Cross-check peer-reported safety state against the local safety envelope.
+13. Replace raw UDP research transport with authenticated, replay-protected safety communication.
+14. Move CSV logging to an async logger for real-time operation.
 
 ---
 

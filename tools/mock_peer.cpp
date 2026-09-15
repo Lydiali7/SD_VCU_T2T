@@ -29,6 +29,12 @@ uint64_t steady_now_ms() {
 }
 
 uint64_t wall_now_us() {
+#ifdef CLOCK_TAI
+    timespec ts = {};
+    if (clock_gettime(CLOCK_TAI, &ts) == 0) {
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL + static_cast<uint64_t>(ts.tv_nsec / 1000ULL);
+    }
+#endif
     auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
 }
@@ -80,6 +86,13 @@ struct MockConfig {
     uint16_t health_target_port = static_cast<uint16_t>(VCU_PEER_PORT + 1);
     uint32_t health_period_ms = 1000;
     uint32_t fresh_timeout_ms = 1000;
+    bool snapshot_tx_enabled = true;
+    std::string snapshot_target_ip;
+    bool snapshot_auto_target = true;
+    uint16_t snapshot_target_port = VCU_PEER_PORT;
+    uint32_t snapshot_period_ms = 50;
+    float snapshot_gap_m = 400.0f;
+    double snapshot_tx_drop_prob = 0.0;
     double rx_drop_prob = 0.0;
     uint32_t rx_delay_base_ms = 0;
     uint32_t rx_delay_jitter_ms = 0;
@@ -98,6 +111,16 @@ MockConfig parse_config(int argc, char* argv[]) {
     }
     cfg.health_period_ms = static_cast<uint32_t>(std::max(50, get_env_int("MOCK_PEER_HEALTH_PERIOD_MS", 1000)));
     cfg.fresh_timeout_ms = static_cast<uint32_t>(std::max(100, get_env_int("MOCK_PEER_FRESH_TIMEOUT_MS", 1000)));
+    cfg.snapshot_tx_enabled = get_env_int("MOCK_PEER_SNAPSHOT_TX", 1) != 0;
+    cfg.snapshot_target_ip = get_env_string("MOCK_PEER_SNAPSHOT_IP", "");
+    cfg.snapshot_auto_target = get_env_int("MOCK_PEER_SNAPSHOT_AUTO_TARGET", 1) != 0;
+    int snapshot_port = get_env_int("MOCK_PEER_SNAPSHOT_PORT", VCU_PEER_PORT);
+    if (snapshot_port > 0 && snapshot_port <= 65535) {
+        cfg.snapshot_target_port = static_cast<uint16_t>(snapshot_port);
+    }
+    cfg.snapshot_period_ms = static_cast<uint32_t>(std::max(10, get_env_int("MOCK_PEER_SNAPSHOT_PERIOD_MS", 50)));
+    cfg.snapshot_gap_m = static_cast<float>(get_env_double("MOCK_PEER_SNAPSHOT_GAP_M", 400.0));
+    cfg.snapshot_tx_drop_prob = std::clamp(get_env_double("MOCK_PEER_SNAPSHOT_TX_DROP_PROB", 0.0), 0.0, 1.0);
     cfg.rx_drop_prob = std::clamp(get_env_double("MOCK_PEER_RX_DROP_PROB", 0.0), 0.0, 1.0);
     cfg.rx_delay_base_ms = static_cast<uint32_t>(std::max(0, get_env_int("MOCK_PEER_RX_DELAY_BASE_MS", 0)));
     cfg.rx_delay_jitter_ms = static_cast<uint32_t>(std::max(0, get_env_int("MOCK_PEER_RX_DELAY_JITTER_MS", 0)));
@@ -115,6 +138,9 @@ struct PeerSnapshotState {
     uint32_t injected_drop_count = 0;
     uint32_t health_send_count = 0;
     uint32_t health_send_error_count = 0;
+    uint32_t snapshot_send_count = 0;
+    uint32_t snapshot_send_error_count = 0;
+    uint32_t snapshot_injected_drop_count = 0;
     uint64_t last_rx_ms = 0;
     T2TAtpSnapshotFrame latest = {};
     sockaddr_in last_snapshot_src = {};
@@ -148,6 +174,18 @@ bool configure_health_target(int sd, const MockConfig& cfg, sockaddr_in& target)
     return true;
 }
 
+bool configure_snapshot_target(const MockConfig& cfg, sockaddr_in& target) {
+    if (cfg.snapshot_target_ip.empty()) return false;
+    target = {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(cfg.snapshot_target_port);
+    if (inet_pton(AF_INET, cfg.snapshot_target_ip.c_str(), &target.sin_addr) != 1) {
+        std::cerr << "[MOCK_PEER] Invalid MOCK_PEER_SNAPSHOT_IP: " << cfg.snapshot_target_ip << "\n";
+        return false;
+    }
+    return true;
+}
+
 std::string endpoint_to_string(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
@@ -163,6 +201,57 @@ void maybe_update_auto_health_target(sockaddr_in& target, bool& has_target,
     target.sin_addr = state.last_snapshot_src.sin_addr;
     target.sin_port = htons(cfg.health_target_port);
     has_target = true;
+}
+
+void maybe_update_auto_snapshot_target(sockaddr_in& target, bool& has_target,
+                                       const PeerSnapshotState& state, const MockConfig& cfg) {
+    if (!cfg.snapshot_auto_target || !cfg.snapshot_target_ip.empty() || !state.has_snapshot) return;
+    target = {};
+    target.sin_family = AF_INET;
+    target.sin_addr = state.last_snapshot_src.sin_addr;
+    target.sin_port = htons(cfg.snapshot_target_port);
+    has_target = true;
+}
+
+void maybe_send_peer_snapshot(int sd, sockaddr_in& target, bool& has_target,
+                              PeerSnapshotState& state, const MockConfig& cfg,
+                              uint32_t& snapshot_seq, uint64_t& last_snapshot_tx_ms,
+                              std::mt19937& rng, std::uniform_real_distribution<double>& probability) {
+    if (!cfg.snapshot_tx_enabled || !state.has_snapshot) return;
+    uint64_t now_ms = steady_now_ms();
+    if (now_ms - last_snapshot_tx_ms < cfg.snapshot_period_ms) return;
+    last_snapshot_tx_ms = now_ms;
+    maybe_update_auto_snapshot_target(target, has_target, state, cfg);
+    if (!has_target) return;
+
+    // Sequence numbers belong to the producer. A network drop must leave a
+    // discontinuity at the receiver rather than hiding the lost transmission.
+    uint32_t tx_seq = snapshot_seq++;
+    if (cfg.snapshot_tx_drop_prob > 0.0 && probability(rng) < cfg.snapshot_tx_drop_prob) {
+        state.snapshot_injected_drop_count++;
+        return;
+    }
+
+    const AtpSnapshot& observed = state.latest.payload.snapshot;
+    AtpSnapshot peer_snapshot = {};
+    build_snapshot_from_sim(cfg.mock_peer_id, wall_now_us(),
+                            cm_to_m(observed.train_pos_cm) + cfg.snapshot_gap_m,
+                            cmps_to_mps(observed.speed_cmps),
+                            cmps_to_mps(observed.accel_cmps2),
+                            observed.atp_status, tx_seq,
+                            TrainDataSource::HIL_FALLBACK, peer_snapshot);
+    T2TAtpSnapshotFrame frame = {};
+    build_t2t_atp_snapshot_frame(cfg.mock_peer_id, state.latest.header.source_train_id,
+                                 state.latest.header.formation_id, tx_seq, 0u,
+                                 peer_snapshot, frame);
+    ssize_t sent = sendto(sd, &frame, sizeof(frame), 0,
+                          reinterpret_cast<const sockaddr*>(&target), sizeof(target));
+    if (sent != static_cast<ssize_t>(sizeof(frame))) {
+        state.snapshot_send_error_count++;
+        std::perror("[MOCK_PEER] sendto peer snapshot");
+        return;
+    }
+    state.snapshot_send_count++;
 }
 
 void maybe_send_health(int sd, sockaddr_in& target, bool& has_target,
@@ -261,7 +350,7 @@ int main(int argc, char* argv[]) {
     setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
     timeval timeout = {};
     timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
+    timeout.tv_usec = 10000;
     setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     sockaddr_in bind_addr = {};
@@ -276,11 +365,15 @@ int main(int argc, char* argv[]) {
 
     sockaddr_in health_target = {};
     bool has_health_target = configure_health_target(sd, cfg, health_target);
+    sockaddr_in snapshot_target = {};
+    bool has_snapshot_target = configure_snapshot_target(cfg, snapshot_target);
 
     PeerSnapshotState state;
     state.expected_source_id = cfg.expected_source_id;
     uint32_t health_seq = 0;
     uint64_t last_health_ms = 0;
+    uint32_t snapshot_tx_seq = 0;
+    uint64_t last_snapshot_tx_ms = 0;
     std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<double> probability(0.0, 1.0);
 
@@ -292,12 +385,20 @@ int main(int argc, char* argv[]) {
               << (has_health_target ? cfg.health_target_ip + ":" + std::to_string(cfg.health_target_port) : "disabled")
               << " health_auto_target=" << (cfg.health_auto_target ? 1 : 0)
               << " health_port=" << cfg.health_target_port
+              << " snapshot_tx=" << (cfg.snapshot_tx_enabled ? 1 : 0)
+              << " snapshot_target="
+              << (has_snapshot_target ? cfg.snapshot_target_ip + ":" + std::to_string(cfg.snapshot_target_port) : "auto")
+              << " snapshot_period_ms=" << cfg.snapshot_period_ms
+              << " snapshot_gap_m=" << cfg.snapshot_gap_m
+              << " snapshot_tx_drop_prob=" << cfg.snapshot_tx_drop_prob
               << " rx_drop_prob=" << cfg.rx_drop_prob
               << " rx_delay_base_ms=" << cfg.rx_delay_base_ms
               << " rx_delay_jitter_ms=" << cfg.rx_delay_jitter_ms << "\n";
 
     while (keep_running) {
         maybe_send_health(sd, health_target, has_health_target, state, cfg, health_seq, last_health_ms);
+        maybe_send_peer_snapshot(sd, snapshot_target, has_snapshot_target, state, cfg,
+                                 snapshot_tx_seq, last_snapshot_tx_ms, rng, probability);
 
         T2TAtpSnapshotFrame frame = {};
         sockaddr_in src_addr = {};
